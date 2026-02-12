@@ -2478,7 +2478,23 @@ function multiportal_SetupWizard(array $params)
             ->first();
 
         if ($existingLink) {
-            return 'Configurable options already exist for this product. Group: ' . $existingLink->name;
+            // If the linked group has options, it's fully set up — nothing to do
+            $linkedOptionCount = Capsule::table('tblproductconfigoptions')
+                ->where('gid', $existingLink->gid)
+                ->count();
+            if ($linkedOptionCount > 0) {
+                return 'Configurable options already exist for this product. Group: ' . $existingLink->name;
+            }
+            // Otherwise the group is empty (e.g. PAYG group missing marker option) —
+            // remove the link so the wizard can re-run and backfill properly
+            Capsule::table('tblproductconfiglinks')
+                ->where('pid', $productId)
+                ->where('gid', $existingLink->gid)
+                ->delete();
+            multiportal_log('SetupWizard', [
+                'product_id' => $productId,
+                'empty_group' => $existingLink->name
+            ], 'Removed link to empty config group, re-running wizard');
         }
 
         // --- Pricing helper ---
@@ -2610,9 +2626,56 @@ function multiportal_SetupWizard(array $params)
             ]);
             $paygGroupId = (int) Capsule::getPdo()->lastInsertId();
 
+            // WHMCS requires at least one option in a config group for the product
+            // to be recognized as having configurable options set up. Add a hidden
+            // marker option that is invisible to clients on the order page.
+            Capsule::table('tblproductconfigoptions')->insert([
+                'gid' => $paygGroupId,
+                'optionname' => 'MP_INIT_FLAG',
+                'optiontype' => 2, // Radio
+                'qtyminimum' => 0,
+                'qtymaximum' => 0,
+                'order' => 1,
+                'hidden' => 1
+            ]);
+            $paygMarkerOptionId = Capsule::getPdo()->lastInsertId();
+            Capsule::table('tblproductconfigoptionssub')->insert([
+                'configid' => $paygMarkerOptionId,
+                'optionname' => 'Enabled',
+                'sortorder' => 0,
+                'hidden' => 0
+            ]);
+            $ensurePricing((int) Capsule::getPdo()->lastInsertId());
+
             multiportal_log('SetupWizard', ['group_id' => $paygGroupId], 'Created PAYG Options group');
         } else {
             $paygGroupId = (int) $paygGroup->id;
+
+            // Backfill: if PAYG group exists but has no options, add the hidden marker
+            $paygOptionCount = Capsule::table('tblproductconfigoptions')
+                ->where('gid', $paygGroupId)
+                ->count();
+            if ($paygOptionCount === 0) {
+                Capsule::table('tblproductconfigoptions')->insert([
+                    'gid' => $paygGroupId,
+                    'optionname' => 'MP_INIT_FLAG',
+                    'optiontype' => 2, // Radio
+                    'qtyminimum' => 0,
+                    'qtymaximum' => 0,
+                    'order' => 1,
+                    'hidden' => 1
+                ]);
+                $paygMarkerOptionId = Capsule::getPdo()->lastInsertId();
+                Capsule::table('tblproductconfigoptionssub')->insert([
+                    'configid' => $paygMarkerOptionId,
+                    'optionname' => 'Enabled',
+                    'sortorder' => 0,
+                    'hidden' => 0
+                ]);
+                $ensurePricing((int) Capsule::getPdo()->lastInsertId());
+                multiportal_log('SetupWizard', ['group_id' => $paygGroupId], 'Backfilled MP_INIT_FLAG marker option');
+            }
+
             multiportal_log('SetupWizard', ['group_id' => $paygGroupId], 'PAYG Options group already exists');
         }
 
