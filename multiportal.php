@@ -2430,7 +2430,8 @@ function multiportal_SetupWizard(array $params)
             if (!$dataCenterResponse || !isset($dataCenterResponse['data'])) {
                 throw new Exception('Data Center UUID is invalid or not found.');
             }
-            multiportal_log('SetupWizard', ['datacenter' => $dataCenterResponse['data']['name'] ?? 'Unknown'], 'Data Center validated');
+            $dataCenterName = $dataCenterResponse['data']['name'] ?? 'Unknown';
+            multiportal_log('SetupWizard', ['datacenter' => $dataCenterName], 'Data Center validated');
         } catch (Exception $e) {
             return 'Data Center Validation Error: ' . $e->getMessage() . ' Please check the Data Center UUID in module settings.';
         }
@@ -2505,34 +2506,6 @@ function multiportal_SetupWizard(array $params)
             }
         };
 
-        // --- Helper to create a hidden Allocation Type dropdown in a group ---
-        $createAllocationTypeOption = function ($groupId, $defaultType) use ($ensurePricing) {
-            Capsule::table('tblproductconfigoptions')->insert([
-                'gid' => $groupId,
-                'optionname' => 'Allocation Type',
-                'optiontype' => 1, // Dropdown
-                'qtyminimum' => 0,
-                'qtymaximum' => 0,
-                'order' => 100,
-                'hidden' => 1 // Hidden from client order page
-            ]);
-            $optionId = Capsule::getPdo()->lastInsertId();
-
-            $allocationTypes = ['Allocation', 'Pay As You Go'];
-            foreach ($allocationTypes as $index => $type) {
-                Capsule::table('tblproductconfigoptionssub')->insert([
-                    'configid' => $optionId,
-                    'optionname' => $type,
-                    'sortorder' => $index,
-                    'hidden' => 0
-                ]);
-                $subId = (int) Capsule::getPdo()->lastInsertId();
-                $ensurePricing($subId);
-            }
-
-            return $optionId;
-        };
-
         // Fetch storage policies from the data center (needed for Allocation group)
         $vdcMgr = new VDCManager($api);
         $storagePolicies = $vdcMgr->getStoragePoliciesByDataCenter($dataCenterId);
@@ -2540,9 +2513,9 @@ function multiportal_SetupWizard(array $params)
             ? $storagePolicies['data'] : [];
 
         // =====================================================================
-        // GROUP 1: MultiPortal Allocation Options
+        // GROUP 1: MultiPortal Allocation Options (per data center)
         // =====================================================================
-        $allocationGroupName = 'MultiPortal Allocation Options';
+        $allocationGroupName = 'MultiPortal Allocation Options - ' . $dataCenterName;
         $allocationGroup = Capsule::table('tblproductconfiggroups')
             ->where('name', $allocationGroupName)
             ->first();
@@ -2616,9 +2589,6 @@ function multiportal_SetupWizard(array $params)
                 }
             }
 
-            // Hidden Allocation Type dropdown (backwards compat)
-            $createAllocationTypeOption($allocationGroupId, 'Allocation');
-
             multiportal_log('SetupWizard', ['group_id' => $allocationGroupId], 'Created Allocation Options group');
         } else {
             $allocationGroupId = (int) $allocationGroup->id;
@@ -2626,9 +2596,9 @@ function multiportal_SetupWizard(array $params)
         }
 
         // =====================================================================
-        // GROUP 2: MultiPortal PAYG Options
+        // GROUP 2: MultiPortal PAYG Options (per data center)
         // =====================================================================
-        $paygGroupName = 'MultiPortal PAYG Options';
+        $paygGroupName = 'MultiPortal PAYG Options - ' . $dataCenterName;
         $paygGroup = Capsule::table('tblproductconfiggroups')
             ->where('name', $paygGroupName)
             ->first();
@@ -2639,9 +2609,6 @@ function multiportal_SetupWizard(array $params)
                 'description' => 'Auto-generated MultiPortal options for Pay As You Go products (no resource selection)'
             ]);
             $paygGroupId = (int) Capsule::getPdo()->lastInsertId();
-
-            // Hidden Allocation Type dropdown only (backwards compat)
-            $createAllocationTypeOption($paygGroupId, 'Pay As You Go');
 
             multiportal_log('SetupWizard', ['group_id' => $paygGroupId], 'Created PAYG Options group');
         } else {
