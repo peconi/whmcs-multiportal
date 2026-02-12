@@ -518,7 +518,30 @@ function multiportal_ConfigOptions($params)
         'PAYG CPU Rate ($/hour)' => ['Type' => 'text', 'Size' => '10', 'Default' => '0.10', 'Description' => 'Cost per CPU core per hour for PAYG'],
         'PAYG Memory Rate ($/GB/hour)' => ['Type' => 'text', 'Size' => '10', 'Default' => '0.05', 'Description' => 'Cost per GB of RAM per hour for PAYG'],
         'PAYG Storage Rate ($/GB/hour)' => ['Type' => 'text', 'Size' => '10', 'Default' => '0.01', 'Description' => 'Cost per GB of storage per hour for PAYG'],
+        'Allocation Type' => ['Type' => 'dropdown', 'Options' => 'Allocation,Pay As You Go', 'Default' => 'Allocation', 'Description' => 'Allocation = fixed resources, Pay As You Go = metered usage'],
     ];
+}
+
+/**
+ * Get allocation type as integer (1=Allocation, 2=PAYG)
+ * Primary: reads from module-level configoption7
+ * Fallback: reads from configurable option dropdown (backwards compat)
+ */
+function multiportal_getAllocationType($params)
+{
+    // Primary: read from module-level configoption7
+    $setting = ModuleConfiguration::get($params, ModuleConfiguration::FIELD_ALLOCATION_TYPE, false);
+    if (!empty($setting)) {
+        return (stripos($setting, 'pay as you go') !== false) ? 2 : 1;
+    }
+    // Fallback: read from configurable option dropdown (backwards compat for existing setups)
+    if (isset($params['configoptions']['Allocation Type'])) {
+        $selected = $params['configoptions']['Allocation Type'];
+        if (stripos($selected, 'pay as you go') !== false || stripos($selected, 'payg') !== false) {
+            return 2;
+        }
+    }
+    return 1; // Default: Allocation
 }
 
 function multiportal_AdminCustomButtonArray($params)
@@ -663,23 +686,20 @@ function multiportal_UpdateVDC(array $params)
         $res = $vdcMgr->getStoragePoliciesByDataCenter($dataCenterId);
         $storagePolicyConfig = verifyStoragePolicyOptions($params['configoptions'], $res);
 
-        // Determine allocation type from configurable option
-        $allocationType = 1; // Default to Allocation
-        if (isset($params['configoptions']['Allocation Type'])) {
-            $selectedType = $params['configoptions']['Allocation Type'];
-            // Convert the selection to allocation type ID
-            if (stripos($selectedType, 'pay as you go') !== false || stripos($selectedType, 'payg') !== false) {
-                $allocationType = 2;
-            }
-        }
+        // Determine allocation type (configoption7 with fallback to configurable option dropdown)
+        $allocationType = multiportal_getAllocationType($params);
+
+        // For PAYG, CPU/Memory are not selected by the client — default to 0
+        $cpu = isset($params['configoptions']['CPU']) ? (int) $params['configoptions']['CPU'] : 0;
+        $memory = isset($params['configoptions']['Memory Allocation']) ? (int) $params['configoptions']['Memory Allocation'] : 0;
 
         $vdc = $vdcMgr->updateVDC(
             $vdcId,
             [
                 'vdc_name' => 'VDC - ' . $params['serviceid'],
                 'allocation_type' => $allocationType,
-                'memory_in_gb' => (int) $params['configoptions']['Memory Allocation'],
-                'core_count' => (int) $params['configoptions']['CPU'],
+                'memory_in_gb' => $memory,
+                'core_count' => $cpu,
                 'is_enabled' => 1,
             ]
         );
@@ -1849,22 +1869,19 @@ function multiportal_CreateAccount(array $params)
         }
         
         // 3. Create VDC
-        // Determine allocation type from configurable option
-        $allocationType = 1; // Default to Allocation
-        if (isset($params['configoptions']['Allocation Type'])) {
-            $selectedType = $params['configoptions']['Allocation Type'];
-            // Convert the selection to allocation type ID
-            if (stripos($selectedType, 'pay as you go') !== false || stripos($selectedType, 'payg') !== false) {
-                $allocationType = 2;
-            }
-        }
+        // Determine allocation type (configoption7 with fallback to configurable option dropdown)
+        $allocationType = multiportal_getAllocationType($params);
+
+        // For PAYG, CPU/Memory are not selected by the client — default to 0
+        $cpu = isset($params['configoptions']['CPU']) ? (int) $params['configoptions']['CPU'] : 0;
+        $memory = isset($params['configoptions']['Memory Allocation']) ? (int) $params['configoptions']['Memory Allocation'] : 0;
 
         $vdc = $vdcMgr->createVDC(
             'VDC - ' . $params['serviceid'],
-            $dataCenterId, // Use the variable we already got from ModuleConfiguration
+            $dataCenterId,
             $tenant['uuid'],
-            (int) $params['configoptions']['CPU'], // CPU
-            (int) $params['configoptions']['Memory Allocation'],  // RAM
+            $cpu,
+            $memory,
             true,
             $allocationType,
         );
@@ -2368,9 +2385,8 @@ function multiportal_cleanupConfirmations()
 function multiportal_SetupWizard(array $params)
 {
     try {
-        // First, validate API credentials and test connection
+        // Validate API credentials and test connection
         try {
-            // Debug: Log what params we're receiving
             multiportal_log('SetupWizard', [
                 'params_keys' => array_keys($params),
                 'has_serverusername' => isset($params['serverusername']),
@@ -2379,32 +2395,24 @@ function multiportal_SetupWizard(array $params)
                 'server_id' => $params['serverid'] ?? 'NO SERVER ID',
                 'product_id' => $params['pid'] ?? 'NO PRODUCT ID'
             ], 'Debug: Checking params structure');
-            
-            // Check if credentials are configured
+
             $clientId = ModuleConfiguration::getClientId($params);
             $clientSecret = ModuleConfiguration::getClientSecret($params);
-            
-            // Test API connection
+
             $api = initiateAPI($params);
-            
-            // Skip the reseller test - we'll validate with the data center check below
+
             multiportal_log('SetupWizard', ['action' => 'API initialized'], 'API client created');
-            
+
         } catch (Exception $e) {
-            $serverId = $params['serverid'] ?? 'unknown';
-            
-            // Simple error message
             if (strpos($e->getMessage(), 'Client ID') !== false || strpos($e->getMessage(), 'Client Secret') !== false) {
                 return 'Error: Server credentials are empty. Go to System Settings > Servers and edit the Multiportal Server to add your API credentials.';
             }
-            
             return 'Error: ' . $e->getMessage();
         }
-        
-        // Now ensure custom fields exist
-        $customFieldsCreated = [];
+
+        // Ensure custom fields exist
         try {
-            $customFieldsCreated = ensureCustomFieldsExist();
+            ensureCustomFieldsExist();
         } catch (Exception $e) {
             return 'Error creating custom fields: ' . $e->getMessage();
         }
@@ -2416,7 +2424,7 @@ function multiportal_SetupWizard(array $params)
             throw new Exception('Data Center UUID must be configured in the product module settings first.');
         }
 
-        // Validate that the Data Center UUID exists
+        // Validate Data Center UUID
         try {
             $dataCenterResponse = $api->get('/data-center/' . $dataCenterId);
             if (!$dataCenterResponse || !isset($dataCenterResponse['data'])) {
@@ -2427,7 +2435,7 @@ function multiportal_SetupWizard(array $params)
             return 'Data Center Validation Error: ' . $e->getMessage() . ' Please check the Data Center UUID in module settings.';
         }
 
-        // Create product-specific custom fields
+        // Create product-specific VDC UUID custom field
         $vdcField = Capsule::table('tblcustomfields')
             ->where('type', 'product')
             ->where('relid', $productId)
@@ -2437,7 +2445,7 @@ function multiportal_SetupWizard(array $params)
         if (!$vdcField) {
             Capsule::table('tblcustomfields')->insert([
                 'type' => 'product',
-                'relid' => $productId,  // THIS IS THE KEY - specific to this product!
+                'relid' => $productId,
                 'fieldname' => 'VDC UUID',
                 'fieldtype' => 'text',
                 'description' => 'Stores the Virtual Data Center identifier',
@@ -2449,48 +2457,36 @@ function multiportal_SetupWizard(array $params)
                 'showinvoice' => '',
                 'sortorder' => 0
             ]);
-            $customFieldsCreated[] = 'Product field: Virtual Data Center UUID (for product ' . $productId . ')';
         }
 
-        // Check if a configurable option group already exists for this product
-        $existingGroup = Capsule::table('tblproductconfiglinks')
+        // Determine this product's allocation type from configoption7
+        $allocationType = multiportal_getAllocationType($params);
+        $isPayg = ($allocationType === 2);
+
+        multiportal_log('SetupWizard', [
+            'allocation_type' => $allocationType,
+            'is_payg' => $isPayg,
+            'configoption7' => $params['configoption7'] ?? 'NOT SET'
+        ], 'Allocation type determined');
+
+        // Check if this product already has a MultiPortal config group linked
+        $existingLink = Capsule::table('tblproductconfiglinks')
             ->join('tblproductconfiggroups', 'tblproductconfiglinks.gid', '=', 'tblproductconfiggroups.id')
             ->where('tblproductconfiglinks.pid', $productId)
             ->where('tblproductconfiggroups.name', 'LIKE', '%MultiPortal%')
             ->first();
 
-        if ($existingGroup) {
-            return 'Configurable options already exist for this product. Group: ' . $existingGroup->name;
+        if ($existingLink) {
+            return 'Configurable options already exist for this product. Group: ' . $existingLink->name;
         }
 
-        // Create a new configurable option group
-        $groupName = 'MultiPortal Options - Product ' . $productId;
-        Capsule::table('tblproductconfiggroups')->insert([
-            'name' => $groupName,
-            'description' => 'Auto-generated MultiPortal configurable options'
-        ]);
-        $groupId = Capsule::getPdo()->lastInsertId();
-
-        // Link the group to this product
-        Capsule::table('tblproductconfiglinks')->insert([
-            'gid' => $groupId,
-            'pid' => $productId
-        ]);
-
+        // --- Pricing helper ---
         $currencies = Capsule::table('tblcurrencies')->select('id')->get();
         $pricingTemplate = [
-            'msetupfee' => '0.00',
-            'qsetupfee' => '0.00',
-            'ssetupfee' => '0.00',
-            'asetupfee' => '0.00',
-            'bsetupfee' => '0.00',
-            'tsetupfee' => '0.00',
-            'monthly' => '0.00',
-            'quarterly' => '0.00',
-            'semiannually' => '0.00',
-            'annually' => '0.00',
-            'biennially' => '0.00',
-            'triennially' => '0.00'
+            'msetupfee' => '0.00', 'qsetupfee' => '0.00', 'ssetupfee' => '0.00',
+            'asetupfee' => '0.00', 'bsetupfee' => '0.00', 'tsetupfee' => '0.00',
+            'monthly' => '0.00', 'quarterly' => '0.00', 'semiannually' => '0.00',
+            'annually' => '0.00', 'biennially' => '0.00', 'triennially' => '0.00'
         ];
         $ensurePricing = function (int $relId) use ($currencies, $pricingTemplate) {
             foreach ($currencies as $currency) {
@@ -2499,7 +2495,6 @@ function multiportal_SetupWizard(array $params)
                     ->where('currency', $currency->id)
                     ->where('relid', $relId)
                     ->first();
-
                 if (!$existing) {
                     Capsule::table('tblpricing')->insert(array_merge([
                         'type' => 'configoptions',
@@ -2510,62 +2505,99 @@ function multiportal_SetupWizard(array $params)
             }
         };
 
-        // Create CPU option
-        Capsule::table('tblproductconfigoptions')->insert([
-            'gid' => $groupId,
-            'optionname' => 'CPU',
-            'optiontype' => 4, // Quantity
-            'qtyminimum' => 1,
-            'qtymaximum' => 128,
-            'order' => 1,
-            'hidden' => 0
-        ]);
-        $cpuOptionId = Capsule::getPdo()->lastInsertId();
+        // --- Helper to create a hidden Allocation Type dropdown in a group ---
+        $createAllocationTypeOption = function ($groupId, $defaultType) use ($ensurePricing) {
+            Capsule::table('tblproductconfigoptions')->insert([
+                'gid' => $groupId,
+                'optionname' => 'Allocation Type',
+                'optiontype' => 1, // Dropdown
+                'qtyminimum' => 0,
+                'qtymaximum' => 0,
+                'order' => 100,
+                'hidden' => 1 // Hidden from client order page
+            ]);
+            $optionId = Capsule::getPdo()->lastInsertId();
 
-        // Create sub-option for CPU
-        Capsule::table('tblproductconfigoptionssub')->insert([
-            'configid' => $cpuOptionId,
-            'optionname' => 'CPU Core',
-            'sortorder' => 0,
-            'hidden' => 0
-        ]);
-        $cpuSubOptionId = (int) Capsule::getPdo()->lastInsertId();
-        $ensurePricing($cpuSubOptionId);
+            $allocationTypes = ['Allocation', 'Pay As You Go'];
+            foreach ($allocationTypes as $index => $type) {
+                Capsule::table('tblproductconfigoptionssub')->insert([
+                    'configid' => $optionId,
+                    'optionname' => $type,
+                    'sortorder' => $index,
+                    'hidden' => 0
+                ]);
+                $subId = (int) Capsule::getPdo()->lastInsertId();
+                $ensurePricing($subId);
+            }
 
-        // Create Memory option
-        Capsule::table('tblproductconfigoptions')->insert([
-            'gid' => $groupId,
-            'optionname' => 'Memory Allocation',
-            'optiontype' => 4, // Quantity
-            'qtyminimum' => 1,
-            'qtymaximum' => 512,
-            'order' => 2,
-            'hidden' => 0
-        ]);
-        $memoryOptionId = Capsule::getPdo()->lastInsertId();
+            return $optionId;
+        };
 
-        // Create sub-option for Memory
-        Capsule::table('tblproductconfigoptionssub')->insert([
-            'configid' => $memoryOptionId,
-            'optionname' => 'GB',
-            'sortorder' => 0,
-            'hidden' => 0
-        ]);
-        $memorySubOptionId = (int) Capsule::getPdo()->lastInsertId();
-        $ensurePricing($memorySubOptionId);
-
-        // Fetch storage policies from the data center
-        $api = initiateAPI($params);
+        // Fetch storage policies from the data center (needed for Allocation group)
         $vdcMgr = new VDCManager($api);
         $storagePolicies = $vdcMgr->getStoragePoliciesByDataCenter($dataCenterId);
+        $storagePolicyData = (isset($storagePolicies['data']) && is_array($storagePolicies['data']))
+            ? $storagePolicies['data'] : [];
 
-        if (isset($storagePolicies['data']) && is_array($storagePolicies['data'])) {
+        // =====================================================================
+        // GROUP 1: MultiPortal Allocation Options
+        // =====================================================================
+        $allocationGroupName = 'MultiPortal Allocation Options';
+        $allocationGroup = Capsule::table('tblproductconfiggroups')
+            ->where('name', $allocationGroupName)
+            ->first();
+
+        if (!$allocationGroup) {
+            Capsule::table('tblproductconfiggroups')->insert([
+                'name' => $allocationGroupName,
+                'description' => 'Auto-generated MultiPortal options for Allocation type products (CPU, Memory, Storage)'
+            ]);
+            $allocationGroupId = (int) Capsule::getPdo()->lastInsertId();
+
+            // CPU option
+            Capsule::table('tblproductconfigoptions')->insert([
+                'gid' => $allocationGroupId,
+                'optionname' => 'CPU',
+                'optiontype' => 4, // Quantity
+                'qtyminimum' => 1,
+                'qtymaximum' => 128,
+                'order' => 1,
+                'hidden' => 0
+            ]);
+            $cpuOptionId = Capsule::getPdo()->lastInsertId();
+            Capsule::table('tblproductconfigoptionssub')->insert([
+                'configid' => $cpuOptionId,
+                'optionname' => 'CPU Core',
+                'sortorder' => 0,
+                'hidden' => 0
+            ]);
+            $ensurePricing((int) Capsule::getPdo()->lastInsertId());
+
+            // Memory option
+            Capsule::table('tblproductconfigoptions')->insert([
+                'gid' => $allocationGroupId,
+                'optionname' => 'Memory Allocation',
+                'optiontype' => 4, // Quantity
+                'qtyminimum' => 1,
+                'qtymaximum' => 512,
+                'order' => 2,
+                'hidden' => 0
+            ]);
+            $memoryOptionId = Capsule::getPdo()->lastInsertId();
+            Capsule::table('tblproductconfigoptionssub')->insert([
+                'configid' => $memoryOptionId,
+                'optionname' => 'GB',
+                'sortorder' => 0,
+                'hidden' => 0
+            ]);
+            $ensurePricing((int) Capsule::getPdo()->lastInsertId());
+
+            // Storage policy options
             $order = 3;
-            foreach ($storagePolicies['data'] as $policy) {
+            foreach ($storagePolicyData as $policy) {
                 if (!empty($policy['name'])) {
-                    // Create storage policy option
                     Capsule::table('tblproductconfigoptions')->insert([
-                        'gid' => $groupId,
+                        'gid' => $allocationGroupId,
                         'optionname' => 'Storage - ' . $policy['name'],
                         'optiontype' => 4, // Quantity
                         'qtyminimum' => 0,
@@ -2574,81 +2606,69 @@ function multiportal_SetupWizard(array $params)
                         'hidden' => 0
                     ]);
                     $storageOptionId = Capsule::getPdo()->lastInsertId();
-
-                    // Create sub-option for storage
                     Capsule::table('tblproductconfigoptionssub')->insert([
                         'configid' => $storageOptionId,
                         'optionname' => 'GB',
                         'sortorder' => 0,
                         'hidden' => 0
                     ]);
-                    $storageSubOptionId = (int) Capsule::getPdo()->lastInsertId();
-                    $ensurePricing($storageSubOptionId);
+                    $ensurePricing((int) Capsule::getPdo()->lastInsertId());
                 }
             }
+
+            // Hidden Allocation Type dropdown (backwards compat)
+            $createAllocationTypeOption($allocationGroupId, 'Allocation');
+
+            multiportal_log('SetupWizard', ['group_id' => $allocationGroupId], 'Created Allocation Options group');
+        } else {
+            $allocationGroupId = (int) $allocationGroup->id;
+            multiportal_log('SetupWizard', ['group_id' => $allocationGroupId], 'Allocation Options group already exists');
         }
 
-        // Optional: Create Allocation Type dropdown
-        Capsule::table('tblproductconfigoptions')->insert([
-            'gid' => $groupId,
-            'optionname' => 'Allocation Type',
-            'optiontype' => 1, // Dropdown
-            'qtyminimum' => 0,
-            'qtymaximum' => 0,
-            'order' => 100,
-            'hidden' => 0
+        // =====================================================================
+        // GROUP 2: MultiPortal PAYG Options
+        // =====================================================================
+        $paygGroupName = 'MultiPortal PAYG Options';
+        $paygGroup = Capsule::table('tblproductconfiggroups')
+            ->where('name', $paygGroupName)
+            ->first();
+
+        if (!$paygGroup) {
+            Capsule::table('tblproductconfiggroups')->insert([
+                'name' => $paygGroupName,
+                'description' => 'Auto-generated MultiPortal options for Pay As You Go products (no resource selection)'
+            ]);
+            $paygGroupId = (int) Capsule::getPdo()->lastInsertId();
+
+            // Hidden Allocation Type dropdown only (backwards compat)
+            $createAllocationTypeOption($paygGroupId, 'Pay As You Go');
+
+            multiportal_log('SetupWizard', ['group_id' => $paygGroupId], 'Created PAYG Options group');
+        } else {
+            $paygGroupId = (int) $paygGroup->id;
+            multiportal_log('SetupWizard', ['group_id' => $paygGroupId], 'PAYG Options group already exists');
+        }
+
+        // =====================================================================
+        // Link the correct group to THIS product based on configoption7
+        // =====================================================================
+        $linkedGroupId = $isPayg ? $paygGroupId : $allocationGroupId;
+        $linkedGroupName = $isPayg ? $paygGroupName : $allocationGroupName;
+
+        Capsule::table('tblproductconfiglinks')->insert([
+            'gid' => $linkedGroupId,
+            'pid' => $productId
         ]);
-        $allocationOptionId = Capsule::getPdo()->lastInsertId();
 
-        multiportal_log('SetupWizard', ['allocation_option_id' => $allocationOptionId], 'Created Allocation Type option');
+        multiportal_log('SetupWizard', [
+            'product_id' => $productId,
+            'linked_group' => $linkedGroupName,
+            'linked_group_id' => $linkedGroupId,
+            'allocation_group_id' => $allocationGroupId,
+            'payg_group_id' => $paygGroupId,
+            'storage_policies' => count($storagePolicyData)
+        ], 'Setup Wizard completed');
 
-        // Create allocation type sub-options
-        $allocationTypes = ['Allocation', 'Pay As You Go'];
-        foreach ($allocationTypes as $index => $type) {
-            // Check if sub-option already exists
-            $exists = Capsule::table('tblproductconfigoptionssub')
-                ->where('configid', $allocationOptionId)
-                ->where('optionname', $type)
-                ->first();
-
-            if (!$exists) {
-                Capsule::table('tblproductconfigoptionssub')->insert([
-                    'configid' => $allocationOptionId,
-                    'optionname' => $type,
-                    'sortorder' => $index,
-                    'hidden' => 0
-                ]);
-                $allocationSubId = (int) Capsule::getPdo()->lastInsertId();
-                multiportal_log('SetupWizard', ['sub_option' => $type, 'index' => $index], 'Created sub-option');
-            } else {
-                $allocationSubId = (int) $exists->id;
-            }
-
-            $ensurePricing($allocationSubId);
-        }
-
-        // Verify the sub-options were created
-        $createdSubs = Capsule::table('tblproductconfigoptionssub')
-            ->where('configid', $allocationOptionId)
-            ->count();
-        multiportal_log('SetupWizard', ['allocation_subs_count' => $createdSubs], 'Verified Allocation Type sub-options');
-
-        // Build success message - keep it simple for WHMCS
-        $message = 'Setup completed successfully! ';
-        $message .= 'Created configurable options group "' . $groupName . '" with ';
-        $message .= 'CPU (1-128), Memory (1-512 GB), ' . count($storagePolicies['data']) . ' storage policies, and Allocation Type. ';
-        $message .= 'IMPORTANT: Due to WHMCS bug, you must now: ';
-        $message .= '1) Go to Configurable Options, ';
-        $message .= '2) Edit "' . $groupName . '", ';
-        $message .= '3) Click any Storage option, ';
-        $message .= '4) Save without changes. ';
-        $message .= 'This fixes the Allocation Type dropdown.';
-        
-        // WHMCS is very limited in what it can display for module commands
-        // We can only return 'success' or 'Error: message'
-        // Any other format shows as an error
-        
-        // The best we can do is return a success message that fits on one line
         return 'success';
     } catch (Exception $e) {
         multiportal_log('SetupWizard', $params, ['error' => $e->getMessage()]);
