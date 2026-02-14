@@ -201,7 +201,7 @@ class VDCManager
             $dateTo = date('Y/m/d 23:59:59');
             $params = ['date_range' => $dateFrom . ' - ' . $dateTo];
         }
-        
+
         $response = $this->api->get('/virtual-data-center/' . $vdcId . '/usage', $params);
 
         if ($response['status'] === 'success') {

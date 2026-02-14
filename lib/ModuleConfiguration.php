@@ -14,7 +14,10 @@ class ModuleConfiguration
     const FIELD_PAYG_CPU_RATE = 4;
     const FIELD_PAYG_MEMORY_RATE = 5;
     const FIELD_PAYG_STORAGE_RATE = 6;
-    
+    const FIELD_ALLOCATION_TYPE = 7;
+    const FIELD_PAYG_BACKUP_STORAGE_RATE = 8;
+    const FIELD_PAYG_ISO_STORAGE_RATE = 9;
+
     // Server credential fields
     const FIELD_CLIENT_ID = 'serverusername';
     const FIELD_CLIENT_SECRET = 'serverpassword';
@@ -26,7 +29,10 @@ class ModuleConfiguration
         self::FIELD_RESELLER_UUID => 'Reseller UUID',
         self::FIELD_PAYG_CPU_RATE => 'PAYG CPU Rate',
         self::FIELD_PAYG_MEMORY_RATE => 'PAYG Memory Rate',
-        self::FIELD_PAYG_STORAGE_RATE => 'PAYG Storage Rate'
+        self::FIELD_PAYG_STORAGE_RATE => 'PAYG Storage Rate',
+        self::FIELD_ALLOCATION_TYPE => 'Allocation Type',
+        self::FIELD_PAYG_BACKUP_STORAGE_RATE => 'Backup Storage Rate',
+        self::FIELD_PAYG_ISO_STORAGE_RATE => 'ISO Storage Rate'
     ];
     
     /**
@@ -66,6 +72,8 @@ class ModuleConfiguration
             case self::FIELD_PAYG_CPU_RATE:
             case self::FIELD_PAYG_MEMORY_RATE:
             case self::FIELD_PAYG_STORAGE_RATE:
+            case self::FIELD_PAYG_BACKUP_STORAGE_RATE:
+            case self::FIELD_PAYG_ISO_STORAGE_RATE:
                 if (!is_numeric($value) || $value < 0) {
                     throw new Exception("$fieldName must be a positive number. Got: $value");
                 }
@@ -111,6 +119,9 @@ class ModuleConfiguration
             'payg_cpu_rate' => self::get($params, self::FIELD_PAYG_CPU_RATE, false) ?? 0.10,
             'payg_memory_rate' => self::get($params, self::FIELD_PAYG_MEMORY_RATE, false) ?? 0.05,
             'payg_storage_rate' => self::get($params, self::FIELD_PAYG_STORAGE_RATE, false) ?? 0.01,
+            'payg_backup_storage_rate' => self::get($params, self::FIELD_PAYG_BACKUP_STORAGE_RATE, false) ?? 0.01,
+            'payg_iso_storage_rate' => self::get($params, self::FIELD_PAYG_ISO_STORAGE_RATE, false) ?? 0.01,
+            'allocation_type' => self::get($params, self::FIELD_ALLOCATION_TYPE, false) ?? 'Allocation',
         ];
     }
     
@@ -153,17 +164,26 @@ class ModuleConfiguration
             $errors[] = $e->getMessage();
         }
         
-        // Validate configurable options
-        $cpu = isset($params['configoptions']['CPU']) ? (int)$params['configoptions']['CPU'] : 0;
-        $memory = isset($params['configoptions']['Memory Allocation']) ? (int)$params['configoptions']['Memory Allocation'] : 0;
-        
-        if ($cpu < 1 || $cpu > 128) {
-            $errors[] = 'CPU cores must be between 1 and 128 (currently: ' . $cpu . ')';
+        // Determine if this is a PAYG product (skip CPU/Memory validation for PAYG)
+        $allocationTypeKey = 'configoption' . self::FIELD_ALLOCATION_TYPE;
+        $isPayg = isset($params[$allocationTypeKey]) &&
+                  stripos($params[$allocationTypeKey], 'pay as you go') !== false;
+
+        if (!$isPayg) {
+            // Validate configurable options only for Allocation type products
+            $cpu = isset($params['configoptions']['CPU'])
+                ? (int)$params['configoptions']['CPU'] : 0;
+            $memory = isset($params['configoptions']['Memory Allocation'])
+                ? (int)$params['configoptions']['Memory Allocation'] : 0;
+
+            if ($cpu < 1 || $cpu > 128) {
+                $errors[] = 'CPU cores must be between 1 and 128 (currently: ' . $cpu . ')';
+            }
+            if ($memory < 1 || $memory > 512) {
+                $errors[] = 'Memory must be between 1 and 512 GB (currently: ' . $memory . ' GB)';
+            }
         }
-        if ($memory < 1 || $memory > 512) {
-            $errors[] = 'Memory must be between 1 and 512 GB (currently: ' . $memory . ' GB)';
-        }
-        
+
         return $errors;
     }
     

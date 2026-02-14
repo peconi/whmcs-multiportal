@@ -28,7 +28,8 @@ function multiportal_MetaData()
 /**
  * Generate a secure password
  */
-function generateSecurePassword($length = 16) {
+function generateSecurePassword($length = 16)
+{
     // Ensure minimum length of 8
     $length = max(8, $length);
     
@@ -60,6 +61,63 @@ function generateSecurePassword($length = 16) {
 }
 
 /**
+ * Ensure per-product custom fields (Tenant UUID, URL) exist for a specific product.
+ *
+ * WHMCS only shows product custom fields on the service admin page when
+ * relid matches the product ID. This creates per-product field definitions
+ * so they appear alongside VDC UUID in the admin UI.
+ */
+function ensureProductCustomFields($productId)
+{
+    if (empty($productId)) {
+        return;
+    }
+
+    $fields = [
+        [
+            'fieldname' => 'Tenant UUID',
+            'description' => 'MultiPortal tenant identifier for this service',
+            'sortorder' => 1,
+        ],
+        [
+            'fieldname' => 'URL',
+            'description' => 'MultiPortal portal URL for this service',
+            'sortorder' => 2,
+        ],
+        [
+            'fieldname' => 'Last Usage Sync',
+            'description' => 'Last PAYG usage sync date',
+            'sortorder' => 3,
+        ],
+    ];
+
+    foreach ($fields as $field) {
+        $existing = Capsule::table('tblcustomfields')
+            ->where('type', 'product')
+            ->where('fieldname', $field['fieldname'])
+            ->where('relid', $productId)
+            ->first();
+
+        if (!$existing) {
+            Capsule::table('tblcustomfields')->insert([
+                'type' => 'product',
+                'relid' => $productId,
+                'fieldname' => $field['fieldname'],
+                'fieldtype' => 'text',
+                'description' => $field['description'],
+                'fieldoptions' => '',
+                'regexpr' => '',
+                'adminonly' => 'on',
+                'required' => '',
+                'showorder' => '',
+                'showinvoice' => '',
+                'sortorder' => $field['sortorder'],
+            ]);
+        }
+    }
+}
+
+/**
  * Ensure custom fields exist - create if missing
  */
 function ensureCustomFieldsExist()
@@ -67,27 +125,14 @@ function ensureCustomFieldsExist()
     $created = [];
 
     try {
+        // Only Tenant UUID remains at client level for backwards-compat fallback.
+        // Username/Password/URL are now stored per-service in product custom fields.
         $clientFields = [
             [
                 'fieldname' => 'MultiPortal Tenant UUID',
                 'fieldtype' => 'text',
                 'description' => 'Stores the MultiPortal tenant identifier',
                 'showorder' => 'on',
-            ],
-            [
-                'fieldname' => 'MultiPortal Username',
-                'fieldtype' => 'text',
-                'description' => 'Username for the MultiPortal tenant portal',
-            ],
-            [
-                'fieldname' => 'MultiPortal Password',
-                'fieldtype' => 'password',
-                'description' => 'Password for the MultiPortal tenant portal',
-            ],
-            [
-                'fieldname' => 'MultiPortal URL',
-                'fieldtype' => 'text',
-                'description' => 'URL for the MultiPortal tenant portal',
             ],
         ];
 
@@ -132,6 +177,43 @@ function ensureCustomFieldsExist()
     } catch (Exception $e) {
         throw new Exception('Error creating Virtual Data Center UUID field: ' . $e->getMessage());
     }
+
+    try {
+        // Product-level Tenant UUID and URL (per-service credential storage)
+        // relid=0 entries serve as fallbacks; per-product entries (created by
+        // ensureProductCustomFields) are what WHMCS displays in the admin UI.
+        $serviceFields = [
+            ['fieldname' => 'Tenant UUID', 'description' => 'MultiPortal tenant identifier for this service', 'sortorder' => 1],
+            ['fieldname' => 'URL', 'description' => 'MultiPortal portal URL for this service', 'sortorder' => 2],
+        ];
+        foreach ($serviceFields as $sf) {
+            $existing = Capsule::table('tblcustomfields')
+                ->where('type', 'product')
+                ->where('fieldname', $sf['fieldname'])
+                ->first();
+            if (!$existing) {
+                Capsule::table('tblcustomfields')->insert([
+                    'type' => 'product',
+                    'relid' => 0,
+                    'fieldname' => $sf['fieldname'],
+                    'fieldtype' => 'text',
+                    'description' => $sf['description'],
+                    'fieldoptions' => '',
+                    'regexpr' => '',
+                    'adminonly' => 'on',
+                    'required' => '',
+                    'showorder' => '',
+                    'showinvoice' => '',
+                    'sortorder' => $sf['sortorder'],
+                ]);
+                $created[] = 'Product field: ' . $sf['fieldname'];
+            }
+        }
+    } catch (Exception $e) {
+        throw new Exception('Error creating product credential fields: ' . $e->getMessage());
+    }
+
+    // Username/Password are stored in tblhosting.username/tblhosting.password (no custom fields needed).
 
     try {
         // Check and create delete confirmation field
@@ -187,6 +269,37 @@ function multiportal_log($action, $request, $response, $processedData = [], $rep
 }
 
 /**
+ * Append a timestamped entry to the service's Admin Notes field.
+ *
+ * Prepends the new entry so the most recent action is always at the top.
+ * Keeps at most $maxEntries log lines (oldest are trimmed).
+ */
+function multiportal_appendAdminNote($serviceId, $message, $maxEntries = 50)
+{
+    $timestamp = date('Y-m-d H:i:s');
+    $newEntry = "[$timestamp] $message";
+
+    $currentNotes = Capsule::table('tblhosting')
+        ->where('id', $serviceId)
+        ->value('notes');
+
+    if (!empty($currentNotes)) {
+        $lines = explode("\n", $currentNotes);
+        // Keep only the most recent entries
+        if (count($lines) >= $maxEntries) {
+            $lines = array_slice($lines, 0, $maxEntries - 1);
+        }
+        $notes = $newEntry . "\n" . implode("\n", $lines);
+    } else {
+        $notes = $newEntry;
+    }
+
+    Capsule::table('tblhosting')
+        ->where('id', $serviceId)
+        ->update(['notes' => $notes]);
+}
+
+/**
  * Validate required configuration options
  */
 function multiportal_validateConfig($params)
@@ -225,71 +338,9 @@ function multiportal_activate()
             ]);
         }
         
-        // Create client custom field for MultiPortal Username
-        $clientUsernameField = Capsule::table('tblcustomfields')
-            ->where('type', 'client')
-            ->where('fieldname', 'MultiPortal Username')
-            ->first();
-
-        if (!$clientUsernameField) {
-            Capsule::table('tblcustomfields')->insert([
-                'type' => 'client',
-                'fieldname' => 'MultiPortal Username',
-                'fieldtype' => 'text',
-                'description' => 'MultiPortal login username',
-                'fieldoptions' => '',
-                'regexpr' => '',
-                'adminonly' => 'on',
-                'required' => '',
-                'showorder' => 'on',
-                'showinvoice' => '',
-                'sortorder' => 0
-            ]);
-        }
-        
-        // Create client custom field for MultiPortal Password
-        $clientPasswordField = Capsule::table('tblcustomfields')
-            ->where('type', 'client')
-            ->where('fieldname', 'MultiPortal Password')
-            ->first();
-
-        if (!$clientPasswordField) {
-            Capsule::table('tblcustomfields')->insert([
-                'type' => 'client',
-                'fieldname' => 'MultiPortal Password',
-                'fieldtype' => 'password',
-                'description' => 'MultiPortal login password',
-                'fieldoptions' => '',
-                'regexpr' => '',
-                'adminonly' => 'on',
-                'required' => '',
-                'showorder' => 'on',
-                'showinvoice' => '',
-                'sortorder' => 0
-            ]);
-        }
-        
-        // Create client custom field for MultiPortal URL
-        $clientUrlField = Capsule::table('tblcustomfields')
-            ->where('type', 'client')
-            ->where('fieldname', 'MultiPortal URL')
-            ->first();
-
-        if (!$clientUrlField) {
-            Capsule::table('tblcustomfields')->insert([
-                'type' => 'client',
-                'fieldname' => 'MultiPortal URL',
-                'fieldtype' => 'text',
-                'description' => 'MultiPortal tenant URL',
-                'fieldoptions' => '',
-                'regexpr' => '',
-                'adminonly' => 'on',
-                'required' => '',
-                'showorder' => 'on',
-                'showinvoice' => '',
-                'sortorder' => 0
-            ]);
-        }
+        // Client-level Username/Password/URL fields are no longer created for new
+        // installs. Credentials are now stored per-service in product custom fields.
+        // Existing client-level fields remain accessible via the fallback chain.
 
         // Create product custom field for VDC UUID
         $productField = Capsule::table('tblcustomfields')
@@ -314,71 +365,35 @@ function multiportal_activate()
             ]);
         }
         
-        // Create product custom field for MultiPortal Username
-        $usernameField = Capsule::table('tblcustomfields')
-            ->where('type', 'product')
-            ->where('fieldname', 'MultiPortal Username')
-            ->first();
-        if (!$usernameField) {
-            Capsule::table('tblcustomfields')->insert([
-                'type' => 'product',
-                'fieldname' => 'MultiPortal Username',
-                'fieldtype' => 'text',
-                'description' => 'MultiPortal login username',
-                'fieldoptions' => '',
-                'regexpr' => '',
-                'adminonly' => 'on',
-                'required' => '',
-                'showorder' => '',
-                'showinvoice' => '',
-                'sortorder' => 1,
-                'relid' => 0
-            ]);
+        // Create product custom fields for Tenant UUID and URL (per-service)
+        $serviceFields = [
+            ['fieldname' => 'Tenant UUID', 'description' => 'MultiPortal tenant identifier for this service', 'sortorder' => 1],
+            ['fieldname' => 'URL', 'description' => 'MultiPortal portal URL for this service', 'sortorder' => 2],
+        ];
+        foreach ($serviceFields as $sf) {
+            $existing = Capsule::table('tblcustomfields')
+                ->where('type', 'product')
+                ->where('fieldname', $sf['fieldname'])
+                ->first();
+            if (!$existing) {
+                Capsule::table('tblcustomfields')->insert([
+                    'type' => 'product',
+                    'fieldname' => $sf['fieldname'],
+                    'fieldtype' => 'text',
+                    'description' => $sf['description'],
+                    'fieldoptions' => '',
+                    'regexpr' => '',
+                    'adminonly' => 'on',
+                    'required' => '',
+                    'showorder' => '',
+                    'showinvoice' => '',
+                    'sortorder' => $sf['sortorder'],
+                    'relid' => 0
+                ]);
+            }
         }
-        
-        // Create product custom field for MultiPortal Password
-        $passwordField = Capsule::table('tblcustomfields')
-            ->where('type', 'product')
-            ->where('fieldname', 'MultiPortal Password')
-            ->first();
-        if (!$passwordField) {
-            Capsule::table('tblcustomfields')->insert([
-                'type' => 'product',
-                'fieldname' => 'MultiPortal Password',
-                'fieldtype' => 'password',
-                'description' => 'MultiPortal login password',
-                'fieldoptions' => '',
-                'regexpr' => '',
-                'adminonly' => 'on',
-                'required' => '',
-                'showorder' => '',
-                'showinvoice' => '',
-                'sortorder' => 2,
-                'relid' => 0
-            ]);
-        }
-        
-        // Create product custom field for MultiPortal URL
-        $urlField = Capsule::table('tblcustomfields')
-            ->where('type', 'product')
-            ->where('fieldname', 'MultiPortal URL')
-            ->first();
-        if (!$urlField) {
-            Capsule::table('tblcustomfields')->insert([
-                'type' => 'product',
-                'fieldname' => 'MultiPortal URL',
-                'fieldtype' => 'text',
-                'description' => 'MultiPortal tenant URL',
-                'fieldoptions' => '',
-                'regexpr' => '',
-                'adminonly' => 'on',
-                'required' => '',
-                'showorder' => '',
-                'showinvoice' => '',
-                'sortorder' => 3,
-                'relid' => 0
-            ]);
-        }
+
+        // Username/Password are stored in tblhosting (no custom fields needed).
 
         return ['status' => 'success', 'description' => 'MultiPortal module activated successfully'];
     } catch (Exception $e) {
@@ -395,7 +410,7 @@ function multiportal_deactivate()
     // Uncomment below if you want to remove them on deactivation
 
     // Capsule::table('tblcustomfields')
-    //     ->whereIn('fieldname', ['MultiPortal Tenant UUID', 'VDC UUID'])
+    //     ->whereIn('fieldname', ['Tenant UUID', 'URL', 'VDC UUID'])
     //     ->delete();
 
     return ['status' => 'success', 'description' => 'MultiPortal module deactivated'];
@@ -435,10 +450,24 @@ function getClientCustomFieldValue($params, $fieldName)
  */
 function getProductCustomFieldValue($serviceId, $fieldName)
 {
-    $customField = Capsule::table('tblcustomfields')
-        ->where('type', 'product')
-        ->where('fieldname', $fieldName)
-        ->first();
+    $productId = Capsule::table('tblhosting')->where('id', $serviceId)->value('packageid');
+
+    // Prefer field matching the service's product, fall back to relid=0
+    $customField = null;
+    if ($productId) {
+        $customField = Capsule::table('tblcustomfields')
+            ->where('type', 'product')
+            ->where('fieldname', $fieldName)
+            ->where('relid', $productId)
+            ->first();
+    }
+    if (!$customField) {
+        $customField = Capsule::table('tblcustomfields')
+            ->where('type', 'product')
+            ->where('fieldname', $fieldName)
+            ->where('relid', 0)
+            ->first();
+    }
 
     if (!$customField) {
         return null;
@@ -501,6 +530,9 @@ function updateProductCustomFieldValue($serviceId, $fieldName, $fieldValue)
     return true;
 }
 
+/**
+ * Define module configuration options shown in WHMCS product settings.
+ */
 function multiportal_ConfigOptions($params)
 {
     // $clientId = $params['serverusername']; // set this in module settings
@@ -518,9 +550,109 @@ function multiportal_ConfigOptions($params)
         'PAYG CPU Rate ($/hour)' => ['Type' => 'text', 'Size' => '10', 'Default' => '0.10', 'Description' => 'Cost per CPU core per hour for PAYG'],
         'PAYG Memory Rate ($/GB/hour)' => ['Type' => 'text', 'Size' => '10', 'Default' => '0.05', 'Description' => 'Cost per GB of RAM per hour for PAYG'],
         'PAYG Storage Rate ($/GB/hour)' => ['Type' => 'text', 'Size' => '10', 'Default' => '0.01', 'Description' => 'Cost per GB of storage per hour for PAYG'],
+        'Allocation Type' => ['Type' => 'dropdown', 'Options' => 'Allocation,Pay As You Go', 'Default' => 'Allocation', 'Description' => 'Allocation = fixed resources, Pay As You Go = metered usage'],
+        'Backup Storage Rate ($/GB/hour)' => ['Type' => 'text', 'Size' => '10', 'Default' => '0.01', 'Description' => 'Cost per GB of backup storage per hour (blank = use Storage Rate)'],
+        'ISO Storage Rate ($/GB/hour)' => ['Type' => 'text', 'Size' => '10', 'Default' => '0.01', 'Description' => 'Cost per GB of ISO storage per hour (blank = use Storage Rate)'],
     ];
 }
 
+/**
+ * Get allocation type as integer (1=Allocation, 2=PAYG).
+ *
+ * Primary: reads from module-level configoption7.
+ * Fallback: reads from configurable option dropdown
+ * for backwards compatibility with existing setups.
+ *
+ * @param array $params WHMCS module parameters
+ * @return int 1 for Allocation, 2 for Pay As You Go
+ */
+function multiportal_getAllocationType($params)
+{
+    // Primary: read from module-level configoption7
+    $setting = ModuleConfiguration::get($params, ModuleConfiguration::FIELD_ALLOCATION_TYPE, false);
+    if (!empty($setting)) {
+        return (stripos($setting, 'pay as you go') !== false) ? 2 : 1;
+    }
+    // Fallback: read from configurable option dropdown (backwards compat for existing setups)
+    if (isset($params['configoptions']['Allocation Type'])) {
+        $selected = $params['configoptions']['Allocation Type'];
+        if (stripos($selected, 'pay as you go') !== false || stripos($selected, 'payg') !== false) {
+            return 2;
+        }
+    }
+    return 1; // Default: Allocation
+}
+
+/**
+ * Get a MultiPortal custom field value with fallback from service-level to client-level.
+ *
+ * Used for Tenant UUID and URL lookups. Username/Password use tblhosting instead
+ * ($params['username']/$params['password']), not custom fields.
+ *
+ * @param string|null $clientFieldName Override for client-level field name (backwards compat).
+ *                                     E.g. 'Tenant UUID' at service level maps to
+ *                                     'MultiPortal Tenant UUID' at client level.
+ */
+function multiportal_getCredential($params, $fieldName, $clientFieldName = null)
+{
+    // 1. Service-level product custom field (primary)
+    if (isset($params['customfields'][$fieldName]) && !empty($params['customfields'][$fieldName])) {
+        return $params['customfields'][$fieldName];
+    }
+    $serviceValue = getProductCustomFieldValue($params['serviceid'], $fieldName);
+    if (!empty($serviceValue)) {
+        return $serviceValue;
+    }
+
+    // 2. Client-level custom field (backwards compat fallback)
+    $clientField = $clientFieldName ?: $fieldName;
+    $clientValue = getClientCustomFieldValue($params, $clientField);
+    if (!empty($clientValue)) {
+        return $clientValue;
+    }
+
+    return null;
+}
+
+/**
+ * Find existing MultiPortal credentials for a client on the same WHMCS server.
+ *
+ * When a client orders a second VDC on the same MultiPortal server, we reuse
+ * their existing tenant and user rather than creating duplicates.
+ *
+ * @return array|null Credential array or null if no existing service found
+ */
+function multiportal_findExistingCredentials($clientId, $serverId, $excludeServiceId = null)
+{
+    $query = Capsule::table('tblhosting')
+        ->where('userid', $clientId)
+        ->where('server', $serverId)
+        ->whereIn('domainstatus', ['Active', 'Suspended']);
+
+    if ($excludeServiceId) {
+        $query->where('id', '!=', $excludeServiceId);
+    }
+
+    $services = $query->get();
+
+    foreach ($services as $service) {
+        $tenantUUID = getProductCustomFieldValue($service->id, 'Tenant UUID');
+        if (!empty($tenantUUID) && !empty($service->username)) {
+            return [
+                'tenant_uuid' => $tenantUUID,
+                'username' => $service->username,
+                'password_encrypted' => $service->password,
+                'url' => getProductCustomFieldValue($service->id, 'URL'),
+            ];
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Define admin-area module command buttons and trigger auto-migration on page view.
+ */
 function multiportal_AdminCustomButtonArray($params)
 {
     $buttonarray = array();
@@ -557,35 +689,103 @@ function multiportal_AdminCustomButtonArray($params)
         $buttonarray['Setup Product Options'] = 'SetupWizard';
     }
 
-    if ($vdcId) {
-        // VDC exists, show update button
-        $buttonarray['Update'] = 'UpdateVDC';
+    // Show re-setup button when configurable options already exist,
+    // allowing admins to sync new storage policies from the data center
+    if (!empty($params['configoptions'])) {
+        $buttonarray['Re-Sync Storage Policies'] = 'ReSetupProductOptions';
+    }
 
-        // Get VDC status to show appropriate suspend/unsuspend button
+    if ($vdcId) {
         try {
             $api = initiateAPI($params);
             $vdcMgr = new VDCManager($api);
             $vdc = $vdcMgr->getVDCById($vdcId);
 
+            // User management (right after WHMCS standard Create button)
+            $buttonarray['Create/Reset User'] = 'CreateMultiPortalUser';
+            $buttonarray['Email Credentials'] = 'EmailCredentials';
+
+            // Re-sync storage policies (inside VDC block so it appears in order)
+            if (!empty($params['configoptions'])) {
+                // Remove the one added outside the block to control position
+                unset($buttonarray['Re-Sync Storage Policies']);
+                $buttonarray['Re-Sync Storage Policies'] = 'ReSetupProductOptions';
+            }
+
+            // Push/Pull data
+            $buttonarray['Push Config to MP'] = 'UpdateVDC';
+            $buttonarray['Pull Config from MP'] = 'SyncVDC';
+
+            // Usage & billing
+            $buttonarray["Show Current Month's Usage"] = 'ViewUsage';
+            $buttonarray["Show Last Month's Usage"] = 'ViewLastMonthUsage';
+            if (multiportal_getAllocationType($params) === 2) {
+                $buttonarray['Re-bill PAYG Usage'] = 'RebillPAYGUsage';
+            }
+
+            // Suspend/Unsuspend
             if ($vdc && isset($vdc['is_enabled'])) {
                 if ($vdc['is_enabled'] == 1) {
-                    $buttonarray['Suspend'] = 'DisableVdc';
+                    $buttonarray['Suspend VDC'] = 'DisableVdc';
                 } else {
-                    $buttonarray['Unsuspend'] = 'EnableVdc';
+                    $buttonarray['Unsuspend VDC'] = 'EnableVdc';
                 }
             }
 
-            $buttonarray['Sync Data'] = 'SyncVDC';
-            $buttonarray['View Usage'] = 'ViewUsage';
-            $buttonarray['Sync Usage & Bill'] = 'SyncUsageAndBill';
-            $buttonarray['Create/Reset User'] = 'CreateMultiPortalUser';
-            $buttonarray['Delete Virtual Data Center ⚠️'] = 'DestroyVdc';
+            // Destructive
+            $buttonarray['⚠️ Delete Virtual Data Center ⚠️'] = 'DestroyVdc';
         } catch (Exception $e) {
             // If we can't get VDC status, show both buttons
             multiportal_log('AdminCustomButtonArray', ['error' => $e->getMessage()], 'Failed to get Virtual Data Center status');
-            $buttonarray['Suspend'] = 'DisableVdc';
-            $buttonarray['Unsuspend'] = 'EnableVdc';
+            $buttonarray['Suspend VDC'] = 'DisableVdc';
+            $buttonarray['Unsuspend VDC'] = 'EnableVdc';
         }
+    }
+
+    // Auto-migrate legacy data on page view (transparent upgrade)
+    try {
+        $productId = Capsule::table('tblhosting')->where('id', $params['serviceid'])->value('packageid');
+        if ($productId) {
+            ensureProductCustomFields($productId);
+            multiportal_autoMigrateService($params['serviceid']);
+        }
+    } catch (Exception $e) {
+        // Silent fail - don't break button rendering
+    }
+
+    // Show "Migrate Credentials" when ANY legacy data exists:
+    // - Client-level Tenant UUID with no service-level Tenant UUID
+    // - Last Usage Sync in old relid=0 field with no per-product field value
+    $needsMigration = false;
+
+    $serviceTenantUUID = getProductCustomFieldValue($params['serviceid'], 'Tenant UUID');
+    if (empty($serviceTenantUUID)) {
+        $clientTenantUUID = getClientCustomFieldValue($params, 'MultiPortal Tenant UUID');
+        if (!empty($clientTenantUUID)) {
+            $needsMigration = true;
+        }
+    }
+
+    if (!$needsMigration) {
+        // Check for legacy Last Usage Sync (relid=0) with data for this service
+        $oldSyncField = Capsule::table('tblcustomfields')
+            ->where('type', 'product')
+            ->where('fieldname', 'Last Usage Sync')
+            ->where('relid', 0)
+            ->first();
+        if ($oldSyncField) {
+            $oldSyncValue = Capsule::table('tblcustomfieldsvalues')
+                ->where('fieldid', $oldSyncField->id)
+                ->where('relid', $params['serviceid'])
+                ->value('value');
+            if (!empty($oldSyncValue)) {
+                $needsMigration = true;
+            }
+        }
+    }
+
+    if ($needsMigration) {
+        $buttonarray['⬆️ MODULE UPGRADE (RUN MIGRATION!) ⬆️'] = 'MigrateCredentials';
     }
 
     return $buttonarray;
@@ -639,6 +839,9 @@ function multiportal_debugConfig($params, $action = 'Debug Config')
     ModuleConfiguration::debug($params);
 }
 
+/**
+ * Push local WHMCS configuration (CPU, RAM, storage policies) to the MultiPortal VDC.
+ */
 function multiportal_UpdateVDC(array $params)
 {
     try {
@@ -663,23 +866,30 @@ function multiportal_UpdateVDC(array $params)
         $res = $vdcMgr->getStoragePoliciesByDataCenter($dataCenterId);
         $storagePolicyConfig = verifyStoragePolicyOptions($params['configoptions'], $res);
 
-        // Determine allocation type from configurable option
-        $allocationType = 1; // Default to Allocation
-        if (isset($params['configoptions']['Allocation Type'])) {
-            $selectedType = $params['configoptions']['Allocation Type'];
-            // Convert the selection to allocation type ID
-            if (stripos($selectedType, 'pay as you go') !== false || stripos($selectedType, 'payg') !== false) {
-                $allocationType = 2;
-            }
+        // Determine allocation type (configoption7 with fallback to configurable option dropdown)
+        $allocationType = multiportal_getAllocationType($params);
+
+        // PAYG storage options are hidden (hidden=1) and WHMCS does not pass
+        // hidden configurable options through $params['configoptions'] during
+        // provisioning. Fall back to reading the config group from the DB.
+        if (empty($storagePolicyConfig) && $allocationType === 2) {
+            $storagePolicyConfig = getPaygStoragePoliciesFromDb($params['pid'], $res);
         }
+
+        // For PAYG, CPU/Memory are not selected by the client.
+        // API requires minimum 1 for both, so default to 1.
+        $cpu = isset($params['configoptions']['CPU'])
+            ? max(1, (int) $params['configoptions']['CPU']) : 1;
+        $memory = isset($params['configoptions']['Memory Allocation'])
+            ? max(1, (int) $params['configoptions']['Memory Allocation']) : 1;
 
         $vdc = $vdcMgr->updateVDC(
             $vdcId,
             [
                 'vdc_name' => 'VDC - ' . $params['serviceid'],
                 'allocation_type' => $allocationType,
-                'memory_in_gb' => (int) $params['configoptions']['Memory Allocation'],
-                'core_count' => (int) $params['configoptions']['CPU'],
+                'memory_in_gb' => $memory,
+                'core_count' => $cpu,
                 'is_enabled' => 1,
             ]
         );
@@ -700,36 +910,61 @@ function multiportal_UpdateVDC(array $params)
             $existingStoragePolicies[$storagePolicy['storage_policy_id']] = $storagePolicy;
         }
 
-        // Process storage policy updates
+        // Build a set of storage_policy_ids from the WHMCS config (capacity > 0)
+        $configPolicyIds = [];
+        foreach ($storagePolicyConfig as $config) {
+            $configPolicyIds[$config['storage_policy_id']] = true;
+        }
+
+        // Process storage policy updates: add new or update existing
         foreach ($storagePolicyConfig as $config) {
             $storagePolicyId = $config['storage_policy_id'];
             $capacity = (int) $config['capacity'];
 
             if (isset($existingStoragePolicies[$storagePolicyId])) {
+                // Update existing policy
                 $vdcStoragePolicyId = $existingStoragePolicies[$storagePolicyId]['uuid'];
-                if ($capacity === 0) {
-                    // Delete policy if capacity is 0
-                    $vdcMgr->deleteStoragePolicy($vdcId, $vdcStoragePolicyId);
-                } else {
-                    // Update existing policy
-                    $vdcMgr->updateStoragePolicy($vdcId, $vdcStoragePolicyId, [
-                        'storage_policy_id' => $storagePolicyId,
-                        'capacity' => $capacity,
-                    ]);
-                }
+                $vdcMgr->updateStoragePolicy($vdcId, $vdcStoragePolicyId, [
+                    'storage_policy_id' => $storagePolicyId,
+                    'capacity' => $capacity,
+                ]);
             } else {
-                if ($capacity > 0) {
-                    // Add new policy if it doesn't exist and capacity is positive
-                    $vdcMgr->addStoragePolicy($vdcId, [
-                        'storage_policy_id' => $storagePolicyId,
-                        'capacity' => $capacity,
-                    ]);
-                }
+                // Add new policy
+                $vdcMgr->addStoragePolicy($vdcId, [
+                    'storage_policy_id' => $storagePolicyId,
+                    'capacity' => $capacity,
+                ]);
             }
         }
 
+        // Remove VDC policies that are no longer in the WHMCS config (set to 0 or removed)
+        foreach ($existingStoragePolicies as $policyId => $policy) {
+            if (!isset($configPolicyIds[$policyId])) {
+                $vdcMgr->deleteStoragePolicy($vdcId, $policy['uuid']);
+            }
+        }
+
+        $policyNames = array_map(function ($p) { return $p['name'] . ' (' . $p['capacity'] . 'GB)'; }, $storagePolicyConfig);
+        $removedNames = [];
+        foreach ($existingStoragePolicies as $policyId => $policy) {
+            if (!isset($configPolicyIds[$policyId])) {
+                $removedNames[] = $policy['name'] ?? $policyId;
+            }
+        }
+        $pushNote = "Push Config to MP: ";
+        if ($allocationType !== 2) {
+            $pushNote .= "CPU: {$cpu}, RAM: {$memory}GB. ";
+        }
+        $pushNote .= "Storage: " . (empty($policyNames) ? 'none' : implode(', ', $policyNames));
+        if (!empty($removedNames)) {
+            $pushNote .= ". Removed: " . implode(', ', $removedNames);
+        }
+        multiportal_appendAdminNote($params['serviceid'], $pushNote);
+
         return 'success';
     } catch (Exception $e) {
+        multiportal_appendAdminNote($params['serviceid'],
+            "Push Config to MP ERROR: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
 }
@@ -761,15 +996,10 @@ function multiportal_SyncVDC(array $params)
 
         multiportal_log('SyncVDC', ['vdcId' => $vdcId], $vdc, ['storagePolicies' => $storagePolicies]);
 
-        // Update service details with latest data (don't set domain to prevent IP/Website buttons)
-        $updateData = [
-            'notes' => "VDC Status: " . ($vdc['is_enabled'] ? 'Enabled' : 'Disabled') . "\n" .
-                "CPU Cores: " . $vdc['core_count'] . "\n" .
-                "Memory: " . $vdc['memory_in_gb'] . " GB\n" .
-                "Last Synced: " . date('Y-m-d H:i:s')
-        ];
+        $vdcStatus = $vdc['is_enabled'] ? 'Enabled' : 'Disabled';
 
         // Update service status based on VDC status
+        $updateData = [];
         if ($vdc['is_enabled'] == 1 && $params['status'] == 'Suspended') {
             $updateData['domainstatus'] = 'Active';
         } elseif ($vdc['is_enabled'] == 0 && $params['status'] == 'Active') {
@@ -777,9 +1007,21 @@ function multiportal_SyncVDC(array $params)
         }
 
         // Update service in WHMCS
-        Capsule::table('tblhosting')
-            ->where('id', $params['serviceid'])
-            ->update($updateData);
+        if (!empty($updateData)) {
+            Capsule::table('tblhosting')
+                ->where('id', $params['serviceid'])
+                ->update($updateData);
+        }
+
+        $pullPolicyNames = array_map(function ($p) {
+            return ($p['name'] ?? $p['storage_policy_name'] ?? 'Unknown') . ' (' . ($p['capacity'] ?? 0) . 'GB)';
+        }, $storagePolicies['data'] ?? []);
+        $pullNote = "Pull Config from MP: VDC {$vdcStatus}. ";
+        if (isset($vdc['allocation_type']) && $vdc['allocation_type'] != 2) {
+            $pullNote .= "CPU: {$vdc['core_count']}, RAM: {$vdc['memory_in_gb']}GB. ";
+        }
+        $pullNote .= "Storage: " . (empty($pullPolicyNames) ? 'none' : implode(', ', $pullPolicyNames));
+        multiportal_appendAdminNote($params['serviceid'], $pullNote);
 
         // Update configurable options to reflect actual VDC values
         // First, get the product's configurable options
@@ -896,14 +1138,21 @@ function multiportal_SyncVDC(array $params)
         return 'success';
     } catch (Exception $e) {
         multiportal_log('SyncVDC', $params, ['error' => $e->getMessage()]);
+        multiportal_appendAdminNote($params['serviceid'],
+            "Pull Config from MP ERROR: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
 }
 
 /**
- * View VDC Usage
+ * Shared helper: fetch and log VDC usage for a given date range
+ *
+ * @param array  $params     WHMCS module params
+ * @param array  $dateRange  ['date_range' => 'YYYY/MM/DD HH:MM:SS - YYYY/MM/DD HH:MM:SS'] or empty for current month
+ * @param string $noteLabel  Label prefix for the admin note (e.g. "Current Month Usage")
+ * @return string 'success' or error message
  */
-function multiportal_ViewUsage(array $params)
+function multiportal_fetchUsage(array $params, array $dateRange, $noteLabel)
 {
     try {
         $api = initiateAPI($params);
@@ -914,60 +1163,90 @@ function multiportal_ViewUsage(array $params)
             throw new Exception('VDC UUID not found. Cannot view usage for non-existent VDC.');
         }
 
-        multiportal_log('ViewUsage', ['vdcId' => $vdcId], 'Fetching VDC usage');
+        multiportal_log('ViewUsage', ['vdcId' => $vdcId, 'label' => $noteLabel], 'Fetching VDC usage');
 
-        // Get VDC usage data
-        $usage = $vdcMgr->getVDCUsage($vdcId);
+        $usage = $vdcMgr->getVDCUsage($vdcId, $dateRange);
 
         multiportal_log('ViewUsage', ['vdcId' => $vdcId, 'usage_keys' => array_keys($usage ?? [])], $usage);
 
-        // Format the usage data for display
-        $message = "VDC Usage Statistics:\n\n";
+        // API returns: virtual_data_center, summary, usage_breakdown, formatted_usage, metadata
+        $formatted = $usage['formatted_usage'] ?? [];
+        $summary   = $usage['summary'] ?? [];
+        $status    = $formatted['current_status'] ?? [];
+        $resSummary = $formatted['resource_summary'] ?? [];
+        $vmStats   = $formatted['vm_statistics'] ?? [];
+        $storageSummary = $formatted['storage_summary'] ?? [];
+        $isPayg = isset($usage['virtual_data_center']['allocation_type']) && $usage['virtual_data_center']['allocation_type'] == 2;
 
-        // Debug: Show what keys are in the response
-        if (is_array($usage)) {
-            $message .= "Debug - Available data: " . implode(', ', array_keys($usage)) . "\n\n";
+        $period = ($summary['date_range']['start'] ?? '?') . ' to ' . ($summary['date_range']['end'] ?? '?');
+
+        // Build detailed admin note
+        $note = "{$noteLabel} ({$period}): ";
+        $note .= "VMs: " . ($status['running_vms'] ?? 'N/A') . " running";
+        if (isset($vmStats['total_runtime_hours'])) {
+            $note .= ", runtime: " . $vmStats['total_runtime_hours'] . "h";
+        }
+        $note .= ". ";
+
+        if (isset($resSummary['cpu'])) {
+            $cpu = $resSummary['cpu'];
+            $note .= "CPU: avg " . ($cpu['average_usage'] ?? 'N/A')
+                . ", total " . ($cpu['total_usage'] ?? 'N/A')
+                . ", daily " . ($cpu['daily_average'] ?? 'N/A') . ". ";
         }
 
-        if (isset($usage['cpu'])) {
-            $message .= "CPU Usage:\n";
-            $message .= "  - Used: " . ($usage['cpu']['used'] ?? 'N/A') . " cores\n";
-            $message .= "  - Allocated: " . ($usage['cpu']['allocated'] ?? 'N/A') . " cores\n";
-            $message .= "  - Usage: " . (isset($usage['cpu']['percentage']) ? $usage['cpu']['percentage'] . '%' : 'N/A') . "\n\n";
+        if (isset($resSummary['memory'])) {
+            $mem = $resSummary['memory'];
+            $note .= "RAM: avg " . ($mem['average_usage'] ?? 'N/A')
+                . ", total " . ($mem['total_usage'] ?? 'N/A')
+                . ", daily " . ($mem['daily_average'] ?? 'N/A') . ". ";
         }
 
-        if (isset($usage['memory'])) {
-            $message .= "Memory Usage:\n";
-            $message .= "  - Used: " . ($usage['memory']['used'] ?? 'N/A') . " GB\n";
-            $message .= "  - Allocated: " . ($usage['memory']['allocated'] ?? 'N/A') . " GB\n";
-            $message .= "  - Usage: " . (isset($usage['memory']['percentage']) ? $usage['memory']['percentage'] . '%' : 'N/A') . "\n\n";
-        }
-
-        if (isset($usage['storage']) && is_array($usage['storage'])) {
-            $message .= "Storage Usage:\n";
-            foreach ($usage['storage'] as $storage) {
-                $message .= "  - " . ($storage['policy_name'] ?? 'Unknown Policy') . ":\n";
-                $message .= "    • Used: " . ($storage['used'] ?? 'N/A') . " GB\n";
-                $message .= "    • Allocated: " . ($storage['allocated'] ?? 'N/A') . " GB\n";
-                $message .= "    • Usage: " . (isset($storage['percentage']) ? $storage['percentage'] . '%' : 'N/A') . "\n";
+        if (!empty($storageSummary)) {
+            $storageParts = [];
+            foreach ($storageSummary as $policyName => $info) {
+                $part = "{$policyName}: avg " . ($info['average_usage'] ?? 'N/A');
+                if (!$isPayg) {
+                    $part .= " / " . ($info['capacity'] ?? 'N/A')
+                        . " (" . ($info['utilization'] ?? 'N/A') . ")";
+                }
+                $storageParts[] = $part;
             }
+            $note .= "Storage: " . implode(', ', $storageParts);
         }
 
-        // Update service notes with usage information
-        $updateData = [
-            'notes' => "=== VDC Usage (Last Updated: " . date('Y-m-d H:i:s') . ") ===\n" . $message
-        ];
+        multiportal_appendAdminNote($params['serviceid'], $note);
 
-        Capsule::table('tblhosting')
-            ->where('id', $params['serviceid'])
-            ->update($updateData);
-
-        // Return success with message appended
-        return $message;
+        return 'success';
     } catch (Exception $e) {
         multiportal_log('ViewUsage', $params, ['error' => $e->getMessage()]);
+        multiportal_appendAdminNote($params['serviceid'],
+            "{$noteLabel} ERROR: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
+}
+
+/**
+ * Show Current Month's Usage
+ */
+function multiportal_ViewUsage(array $params)
+{
+    return multiportal_fetchUsage($params, [], "Current Month Usage");
+}
+
+/**
+ * Show Last Month's Usage
+ */
+function multiportal_ViewLastMonthUsage(array $params)
+{
+    $dateFrom = date('Y/m/d 00:00:00', strtotime('first day of last month'));
+    $dateTo   = date('Y/m/d 23:59:59', strtotime('last day of last month'));
+
+    return multiportal_fetchUsage(
+        $params,
+        ['date_range' => $dateFrom . ' - ' . $dateTo],
+        "Last Month Usage"
+    );
 }
 
 /**
@@ -979,83 +1258,183 @@ function multiportal_CreateMultiPortalUser(array $params)
         $api = initiateAPI($params);
         $tenantMgr = new TenantManager($api);
         
-        // Get tenant UUID
-        $tenantUUID = getClientCustomFieldValue($params, 'MultiPortal Tenant UUID');
+        // Get tenant UUID (service-level 'Tenant UUID' → client-level 'MultiPortal Tenant UUID' fallback)
+        $tenantUUID = multiportal_getCredential($params, 'Tenant UUID', 'MultiPortal Tenant UUID');
         if (empty($tenantUUID)) {
             throw new Exception('Tenant UUID not found. Cannot create user without tenant.');
         }
-        
+
         // Get tenant details
         $tenant = $tenantMgr->findTenantById($tenantUUID);
         if (!$tenant) {
             throw new Exception('Tenant not found in MultiPortal.');
         }
-        
+
         multiportal_log('CreateMultiPortalUser', ['tenantUUID' => $tenantUUID], 'Starting user creation/reset');
-        
-        // Generate username from email
-        $emailParts = explode('@', $params['clientsdetails']['email']);
-        $baseUsername = $emailParts[0];
-        $multiportalUsername = $baseUsername . '_' . $params['serviceid'];
-        
+
         // Generate secure password
         $multiportalPassword = generateSecurePassword(16);
-        
-        // Create user in MultiPortal
-        $user = $tenantMgr->createUser(
-            $tenant['uuid'],
-            $multiportalUsername,
-            $multiportalPassword,
-            $params['clientsdetails']['email'],
-            $params['clientsdetails']['firstname'],
-            $params['clientsdetails']['lastname'],
-            'Tenant Administrator'
-        );
-        
-        // Store credentials in WHMCS service fields
+
+        // Check if this service already has a username (from a prior provisioning or reset).
+        // If so, find that user in MultiPortal and reset their password.
+        $currentUsername = !empty($params['username']) ? $params['username'] : '';
+        $clientEmail = $params['clientsdetails']['email'];
+
+        // Try to find an existing user by current username or email
+        $existingUser = $tenantMgr->findUserInTenant($tenant['uuid'], $currentUsername, $clientEmail);
+
+        if ($existingUser && !empty($existingUser['id'])) {
+            // User exists — reset their password
+            $multiportalUsername = $existingUser['username'];
+
+            $tenantMgr->updateUser($tenant['uuid'], $existingUser['id'], [
+                'password' => $multiportalPassword,
+                'confirmPassword' => $multiportalPassword,
+            ]);
+
+            $action = 'reset';
+            multiportal_log('CreateMultiPortalUser', [
+                'user_id' => $existingUser['id'],
+                'username' => $multiportalUsername,
+            ], 'Existing user found — password reset');
+        } else {
+            // No existing user found — create a new one
+            $emailParts = explode('@', $clientEmail);
+            $baseUsername = $emailParts[0];
+            $multiportalUsername = $baseUsername . '_' . $params['serviceid'];
+
+            $tenantMgr->createUser(
+                $tenant['uuid'],
+                $multiportalUsername,
+                $multiportalPassword,
+                $clientEmail,
+                $params['clientsdetails']['firstname'],
+                $params['clientsdetails']['lastname'],
+                'Tenant Administrator'
+            );
+
+            $action = 'created';
+        }
+
+        // Store credentials in tblhosting (for ClientArea $params['username']/$params['password'])
         Capsule::table('tblhosting')
             ->where('id', $params['serviceid'])
             ->update([
                 'username' => $multiportalUsername,
                 'password' => encrypt($multiportalPassword)
             ]);
-        
-        // Get MultiPortal URL from API configuration
-        $multiportalUrl = '';
-        $apiUrl = ModuleConfiguration::get($params, ModuleConfiguration::FIELD_API_URL);
-        if (!empty($apiUrl)) {
-            // Parse the API URL to get the base domain
-            $parsedUrl = parse_url($apiUrl);
-            if (isset($parsedUrl['host'])) {
-                $multiportalUrl = 'https://' . $parsedUrl['host'];
-            }
-        }
-        
-        // If empty, throw error
-        if (empty($multiportalUrl)) {
-            throw new Exception('MultiPortal URL could not be determined. Please check API Base URL in server configuration.');
-        }
-        
-        // Don't store URL in domain field to prevent WHMCS from showing IP/Website buttons
-        // The URL is available in the client area template instead
-        
+
         multiportal_log('CreateMultiPortalUser', [
+            'action' => $action,
             'username' => $multiportalUsername,
-            'url' => $multiportalUrl,
+            'service_id' => $params['serviceid'],
             'tenant' => $tenant['name']
-        ], 'User created/reset successfully');
-        
-        $message = "MultiPortal User Created/Reset Successfully\n\n";
-        $message .= "Username: " . $multiportalUsername . "\n";
-        $message .= "Password: " . $multiportalPassword . "\n";
-        $message .= "Portal URL: " . $multiportalUrl . "\n\n";
-        $message .= "These credentials have been stored in the service custom fields.";
-        
-        // Return success with message appended
-        return $message;
-        
+        ], "User $action successfully. Credentials stored in service record.");
+
+        multiportal_appendAdminNote($params['serviceid'],
+            "Create/Reset User: User {$action} — username '{$multiportalUsername}', tenant '{$tenant['name']}'");
+
+        return 'success';
+
     } catch (Exception $e) {
         multiportal_log('CreateMultiPortalUser', $params, ['error' => $e->getMessage()]);
+        multiportal_appendAdminNote($params['serviceid'],
+            "Create/Reset User ERROR: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+/**
+ * Email the client their MultiPortal portal credentials.
+ *
+ * Sends two separate emails for security: one with the username and
+ * portal URL, another with the temporary password and a link to
+ * change it immediately.
+ */
+function multiportal_EmailCredentials(array $params)
+{
+    try {
+        // Get current credentials from the service record
+        $service = Capsule::table('tblhosting')->where('id', $params['serviceid'])->first();
+        if (!$service) {
+            throw new Exception('Service not found.');
+        }
+
+        $username = $service->username;
+        if (empty($username)) {
+            throw new Exception('No username set for this service. Run Create/Reset User first.');
+        }
+
+        // Decrypt the stored password
+        $password = decrypt($service->password);
+        if (empty($password)) {
+            throw new Exception('No password set for this service. Run Create/Reset User first.');
+        }
+
+        // Get portal URL from service custom field, fall back to deriving from API URL
+        $portalUrl = getProductCustomFieldValue($params['serviceid'], 'URL');
+        if (empty($portalUrl)) {
+            $apiUrl = ModuleConfiguration::get($params, ModuleConfiguration::FIELD_API_URL);
+            $portalUrl = rtrim($apiUrl, '/');
+            $portalUrl = preg_replace('#/api(/v\d+)?$#', '', $portalUrl);
+        }
+
+        // Get client info for the emails
+        $clientName = trim($params['clientsdetails']['firstname'] . ' ' . $params['clientsdetails']['lastname']);
+        $passwordChangeUrl = rtrim($portalUrl, '/') . '/user/profile#password';
+
+        // --- Email 1/2: Username ---
+        $usernameBody = '<p>Hello ' . htmlspecialchars($clientName) . ',</p>'
+            . '<p><b>Portal URL:</b> <a href="' . htmlspecialchars($portalUrl) . '">' . htmlspecialchars($portalUrl) . '</a><br>'
+            . '<b>Username:</b> ' . htmlspecialchars($username) . '</p>'
+            . '<p>Your <b>temporary</b> password will arrive in a separate email.</p>'
+            . '<p>If you have any questions, please don\'t hesitate to contact our support team.</p>';
+
+        $result1 = localAPI('SendEmail', [
+            'id' => $params['serviceid'],
+            'customtype' => 'product',
+            'customsubject' => 'Cloud Portal Credentials Reset (1/2) — Username',
+            'custommessage' => $usernameBody,
+        ]);
+
+        if ($result1['result'] !== 'success') {
+            throw new Exception('Failed to send username email: ' . ($result1['message'] ?? json_encode($result1)));
+        }
+
+        // --- Email 2/2: Temporary Password ---
+        $passwordBody = '<p>Hello ' . htmlspecialchars($clientName) . ',</p>'
+            . '<p><b>Temporary Password:</b> <code>' . htmlspecialchars($password) . '</code></p>'
+            . '<p>Please login at <a href="' . htmlspecialchars($passwordChangeUrl) . '">'
+            . htmlspecialchars($passwordChangeUrl) . '</a> and change your password right away.</p>'
+            . '<p><strong>After changing your password, please DELETE this email.</strong></p>';
+
+        $result2 = localAPI('SendEmail', [
+            'id' => $params['serviceid'],
+            'customtype' => 'product',
+            'customsubject' => 'Cloud Portal Credentials Reset (2/2) — TEMPORARY Password',
+            'custommessage' => $passwordBody,
+        ]);
+
+        if ($result2['result'] !== 'success') {
+            throw new Exception('Username email sent, but password email failed: ' . ($result2['message'] ?? json_encode($result2)));
+        }
+
+        multiportal_log('EmailCredentials', [
+            'service_id' => $params['serviceid'],
+            'client_id' => $params['userid'],
+            'username' => $username,
+            'email_to' => $params['clientsdetails']['email'],
+        ], 'Credentials emailed to client (2 emails)');
+
+        multiportal_appendAdminNote($params['serviceid'],
+            "Email Credentials: Sent 2 emails to {$params['clientsdetails']['email']} (username: {$username})");
+
+        return 'success';
+
+    } catch (Exception $e) {
+        multiportal_log('EmailCredentials', $params, ['error' => $e->getMessage()]);
+        multiportal_appendAdminNote($params['serviceid'],
+            "Email Credentials ERROR: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
 }
@@ -1069,15 +1448,15 @@ function multiportal_CreateApiUser(array $params)
         $api = initiateAPI($params);
         $tenantMgr = new TenantManager($api);
         
-        // Get tenant UUID
-        $tenantUUID = getClientCustomFieldValue($params, 'MultiPortal Tenant UUID');
+        // Get tenant UUID (service-level 'Tenant UUID' → client-level 'MultiPortal Tenant UUID' fallback)
+        $tenantUUID = multiportal_getCredential($params, 'Tenant UUID', 'MultiPortal Tenant UUID');
         if (empty($tenantUUID)) {
             throw new Exception('Tenant UUID not found. Cannot create API user without tenant.');
         }
-        
-        // Check if API credentials already exist at client level
-        $existingApiUsername = getClientCustomFieldValue($params, 'MultiPortal API Username');
-        $existingApiPassword = getClientCustomFieldValue($params, 'MultiPortal API Password');
+
+        // Check if API credentials already exist
+        $existingApiUsername = multiportal_getCredential($params, 'MultiPortal API Username');
+        $existingApiPassword = multiportal_getCredential($params, 'MultiPortal API Password');
         
         if ($existingApiUsername && $existingApiPassword) {
             // API user already exists, return existing credentials
@@ -1223,9 +1602,33 @@ function multiportal_CreateApiUser(array $params)
             ]);
         }
         
-        // Store the API credentials at client level
-        setClientCustomFieldValue($params['userid'], 'MultiPortal API Username', $apiUsername);
-        setClientCustomFieldValue($params['userid'], 'MultiPortal API Password', $apiPassword);
+        // Store the API credentials at service level
+        // Create product-level fields if they don't exist
+        foreach (['MultiPortal API Username', 'MultiPortal API Password'] as $fname) {
+            $ftype = (strpos($fname, 'Password') !== false) ? 'password' : 'text';
+            $exists = Capsule::table('tblcustomfields')
+                ->where('type', 'product')
+                ->where('fieldname', $fname)
+                ->first();
+            if (!$exists) {
+                Capsule::table('tblcustomfields')->insert([
+                    'type' => 'product',
+                    'relid' => 0,
+                    'fieldname' => $fname,
+                    'fieldtype' => $ftype,
+                    'description' => 'API credentials for MultiPortal access',
+                    'fieldoptions' => '',
+                    'regexpr' => '',
+                    'adminonly' => 'on',
+                    'required' => '',
+                    'showorder' => '',
+                    'showinvoice' => '',
+                    'sortorder' => 10
+                ]);
+            }
+        }
+        setCustomFieldValue($params['serviceid'], 'MultiPortal API Username', $apiUsername);
+        setCustomFieldValue($params['serviceid'], 'MultiPortal API Password', $apiPassword);
         
         // Get tenant URL
         if (isset($tenant['domain']) && !empty($tenant['domain'])) {
@@ -1260,461 +1663,713 @@ function multiportal_CreateApiUser(array $params)
 /**
  * Sync usage data from Multiportal and create billable items for PAYG services
  */
-function multiportal_SyncUsageAndBill(array $params)
+/**
+ * Re-bill PAYG Usage (admin button).
+ *
+ * Deletes all uninvoiced billable items for this VDC, resets Last Usage Sync
+ * to the end of the last invoiced period, fetches usage with include_history=true,
+ * and recreates billable items at current rates.
+ */
+function multiportal_RebillPAYGUsage(array $params)
 {
     try {
         $api = initiateAPI($params);
         $vdcMgr = new VDCManager($api);
 
-        // Get VDC UUID
-        $vdcId = isset($params['customfields']['VDC UUID']) ? $params['customfields']['VDC UUID'] : getProductCustomFieldValue($params['serviceid'], 'VDC UUID');
+        $vdcId = isset($params['customfields']['VDC UUID'])
+            ? $params['customfields']['VDC UUID']
+            : getProductCustomFieldValue($params['serviceid'], 'VDC UUID');
         if (empty($vdcId)) {
-            throw new Exception('VDC UUID not found. Cannot sync usage for non-existent VDC.');
+            throw new Exception('VDC UUID not found. Cannot bill usage for non-existent VDC.');
         }
 
-        // Get VDC details to check allocation type
+        // Verify PAYG
         $vdc = $vdcMgr->getVDCById($vdcId);
-        if (!$vdc) {
-            throw new Exception('VDC not found.');
+        if (!$vdc || !isset($vdc['allocation_type']) || $vdc['allocation_type'] != 2) {
+            return 'This VDC is not configured for PAYG billing (allocation type: '
+                . ($vdc['allocation_type'] ?? 'unknown') . ').';
         }
 
-        // Log the VDC details for debugging
-        multiportal_log('SyncUsageAndBill', [
-            'vdcId' => $vdcId,
-            'vdc_data' => $vdc,
-            'allocation_type' => $vdc['allocation_type'] ?? 'not set'
-        ], 'VDC details fetched');
+        $vdcName = $params['domain'] ?? ('VDC-' . $params['serviceid']);
 
-        // Check if this is a PAYG VDC (allocation_type = 2)
-        if (!isset($vdc['allocation_type']) || $vdc['allocation_type'] != 2) {
-            return 'This Virtual Data Center is not configured for PAYG billing (allocation type: ' . ($vdc['allocation_type'] ?? 'unknown') . '). Full Virtual Data Center data logged for debugging.';
-        }
+        // ── Read previous Last Usage Sync for tracing ────────────
+        $prevSyncValue = getProductCustomFieldValue($params['serviceid'], 'Last Usage Sync');
 
-        multiportal_log('SyncUsageAndBill', ['vdcId' => $vdcId], 'Fetching Virtual Data Center usage for PAYG billing');
+        // ── Delete uninvoiced items and find sync reset date ─────
+        $cleanup = multiportal_deleteUninvoicedPAYGItems($params['userid'], $vdcId);
 
-        // Get or set billing period (default to current month)
-        $currentDate = new DateTime();
-        $billingStart = new DateTime($currentDate->format('Y-m-01'));
-        $billingEnd = clone $currentDate;
-
-        // Check if we have a last sync date stored
-        $lastSyncField = Capsule::table('tblcustomfields')
-            ->where('type', 'product')
-            ->where('fieldname', 'Last Usage Sync')
-            ->first();
-
-        if (!$lastSyncField) {
-            // Create the custom field if it doesn't exist
-            $lastSyncFieldId = Capsule::table('tblcustomfields')->insertGetId([
-                'type' => 'product',
-                'fieldname' => 'Last Usage Sync',
-                'fieldtype' => 'text',
-                'description' => 'Last PAYG usage sync date',
-                'adminonly' => 'on'
-            ]);
+        // Determine billing start: day after last invoiced day → first of month
+        // duedate on billable items = the bucket's actual day (YYYY-MM-DD),
+        // so we start from the NEXT day to avoid re-billing an invoiced day.
+        if (!empty($cleanup['last_invoiced_date'])) {
+            $billingStart = new DateTime($cleanup['last_invoiced_date']);
+            $billingStart->modify('+1 day');
+            $billingStart->setTime(0, 0, 0);
         } else {
-            $lastSyncFieldId = $lastSyncField->id;
+            $billingStart = new DateTime('first day of this month midnight');
         }
 
-        // Get last sync date
-        $lastSyncValue = Capsule::table('tblcustomfieldsvalues')
-            ->where('fieldid', $lastSyncFieldId)
-            ->where('relid', $params['serviceid'])
+        // Don't bill before the VDC existed — floor to Last Usage Sync creation date
+        if (!empty($prevSyncValue)) {
+            $syncFloor = new DateTime($prevSyncValue);
+            $syncFloor->setTime(0, 0, 0);
+            if ($syncFloor > $billingStart) {
+                $billingStart = $syncFloor;
+            }
+        }
+
+        $billingEnd = new DateTime();
+
+        // If last invoiced date is today, billingStart lands on tomorrow.
+        // Fall back to Last Usage Sync to bill the post-invoice remainder of today.
+        if ($billingStart > $billingEnd) {
+            if (!empty($prevSyncValue)) {
+                $billingStart = new DateTime($prevSyncValue);
+            } else {
+                multiportal_appendAdminNote($params['serviceid'],
+                    "Re-bill PAYG: All usage is invoiced and no Last Usage Sync found.");
+                return 'success';
+            }
+        }
+
+        // ── Load rates ──────────────────────────────────────────
+        $productRow = Capsule::table('tblproducts as p')
+            ->join('tblhosting as h', 'h.packageid', '=', 'p.id')
+            ->where('h.id', $params['serviceid'])
+            ->select('p.configoption4', 'p.configoption5', 'p.configoption6', 'p.configoption8', 'p.configoption9')
             ->first();
+        $rates = multiportal_loadPAYGRates($productRow);
 
-        if ($lastSyncValue && $lastSyncValue->value) {
-            $billingStart = new DateTime($lastSyncValue->value);
-        }
-
-        // Format dates for display
-        $periodDescription = sprintf(
-            "Usage from %s to %s",
-            $billingStart->format('Y-m-d'),
-            $billingEnd->format('Y-m-d H:i')
-        );
-
-        // Get VDC usage data for the billing period
+        // ── Fetch usage with historical data ────────────────────
         $usageParams = [
-            'date_range' => $billingStart->format('Y/m/d 00:00:00') . ' - ' . $billingEnd->format('Y/m/d 23:59:59')
+            'date_range'      => $billingStart->format('Y/m/d H:i:s')
+                . ' - ' . $billingEnd->format('Y/m/d H:i:s'),
+            'include_history' => 'true',
         ];
         $usage = $vdcMgr->getVDCUsage($vdcId, $usageParams);
-        
-        multiportal_log('SyncUsageAndBill', [
-            'vdcId' => $vdcId,
-            'usage_data' => $usage,
-            'date_range' => $usageParams['date_range']
-        ], 'Fetched usage data');
 
-        // Check if we got usage data
         if (!$usage || !is_array($usage)) {
-            throw new Exception('No usage data returned from API');
-        }
-        
-        // Log the full usage response for debugging
-        multiportal_log('SyncUsageAndBill_Debug', [
-            'has_summary' => isset($usage['summary']),
-            'has_usage_summary' => isset($usage['summary']['usage_summary']),
-            'has_usage_breakdown' => isset($usage['usage_breakdown']),
-            'usage_keys' => array_keys($usage),
-            'summary_keys' => isset($usage['summary']) ? array_keys($usage['summary']) : [],
-            'breakdown_keys' => isset($usage['usage_breakdown']) ? array_keys($usage['usage_breakdown']) : []
-        ], 'Usage data structure');
-        
-        // Load rates from module configuration or fall back to config file
-        $rates = [];
-        
-        // Check if rates are configured in module settings using ModuleConfiguration
-        $cpuRate = ModuleConfiguration::get($params, ModuleConfiguration::FIELD_PAYG_CPU_RATE, false);
-        if ($cpuRate !== null) {
-            $rates['cpu_per_hour'] = (float) $cpuRate;
-        }
-        
-        $memoryRate = ModuleConfiguration::get($params, ModuleConfiguration::FIELD_PAYG_MEMORY_RATE, false);
-        if ($memoryRate !== null) {
-            $rates['memory_per_gb_hour'] = (float) $memoryRate;
-        }
-        
-        $storageRate = ModuleConfiguration::get($params, ModuleConfiguration::FIELD_PAYG_STORAGE_RATE, false);
-        if ($storageRate !== null) {
-            $rates['storage_per_gb_hour'] = (float) $storageRate;
-        }
-        
-        // Fall back to config file if any rates are missing
-        if (empty($rates['cpu_per_hour']) || empty($rates['memory_per_gb_hour']) || empty($rates['storage_per_gb_hour'])) {
-            require_once __DIR__ . '/payg_config.php';
-            $rates = array_merge([
-                'cpu_per_hour' => 0.10,
-                'memory_per_gb_hour' => 0.05,
-                'storage_per_gb_hour' => 0.01
-            ], $rates);
+            throw new Exception('No usage data returned from API.');
         }
 
-        $totalCharge = 0;
-        $chargeDetails = [];
-        $debugInfo = [];
-
-        // Calculate hours in billing period
-        $interval = $billingStart->diff($billingEnd);
-        $totalHours = ($interval->days * 24) + $interval->h + ($interval->i / 60);
-
-        // Get total hours from summary if available, otherwise calculate
-        if (isset($usage['summary']['total_hours'])) {
-            $totalHours = $usage['summary']['total_hours'];
-        }
-
-        // Process resource usage based on the new API structure
-        if (isset($usage['summary']['usage_summary'])) {
-            $usageSummary = $usage['summary']['usage_summary'];
-            $debugInfo['usage_summary'] = $usageSummary;
-            
-            // CPU charges
-            // The API returns total_cpu_usage which appears to be in CPU-seconds
-            // Convert to CPU-hours: cpu-seconds / 3600
-            if (isset($usageSummary['total_cpu_usage']) && $usageSummary['total_cpu_usage'] > 0) {
-                $cpuHours = $usageSummary['total_cpu_usage'] / 3600;
-                $cpuCharge = $cpuHours * $rates['cpu_per_hour'];
-                $totalCharge += $cpuCharge;
-                $chargeDetails[] = sprintf(
-                    "CPU: %.2f core-hours × $%.2f = $%.2f",
-                    $cpuHours,
-                    $rates['cpu_per_hour'],
-                    $cpuCharge
-                );
-                $debugInfo['cpu'] = [
-                    'raw_value' => $usageSummary['total_cpu_usage'],
-                    'hours' => $cpuHours,
-                    'charge' => $cpuCharge
-                ];
-            }
-            
-            // Memory charges
-            // The API returns total_memory_usage which appears to be in byte-seconds
-            // Convert to GB-hours: (byte-seconds / 1024^3) / 3600
-            if (isset($usageSummary['total_memory_usage']) && $usageSummary['total_memory_usage'] > 0) {
-                $memoryGBHours = ($usageSummary['total_memory_usage'] / (1024 * 1024 * 1024)) / 3600;
-                $memoryCharge = $memoryGBHours * $rates['memory_per_gb_hour'];
-                $totalCharge += $memoryCharge;
-                $chargeDetails[] = sprintf(
-                    "Memory: %.2f GB-hours × $%.2f = $%.2f",
-                    $memoryGBHours,
-                    $rates['memory_per_gb_hour'],
-                    $memoryCharge
-                );
-                $debugInfo['memory'] = [
-                    'raw_value' => $usageSummary['total_memory_usage'],
-                    'gb_hours' => $memoryGBHours,
-                    'charge' => $memoryCharge
-                ];
-            }
-        } else {
-            $debugInfo['error'] = 'No usage summary found in response';
-        }
-
-        // Process Storage charges
-        if (isset($usage['usage_breakdown']['storage']) && is_array($usage['usage_breakdown']['storage'])) {
-            $totalStorageGBHours = 0;
-            $debugInfo['storage'] = [];
-            
-            foreach ($usage['usage_breakdown']['storage'] as $storageName => $storageData) {
-                $debugInfo['storage'][$storageName] = [
-                    'total_usage' => $storageData['total_usage'] ?? 0,
-                    'uptime' => $storageData['uptime'] ?? 0
-                ];
-                
-                if (isset($storageData['total_usage']) && isset($storageData['uptime']) && $storageData['uptime'] > 0) {
-                    // Convert byte-seconds to GB-hours
-                    $storageGBHours = ($storageData['total_usage'] / (1024 * 1024 * 1024)) / 3600;
-                    $totalStorageGBHours += $storageGBHours;
-                    $debugInfo['storage'][$storageName]['gb_hours'] = $storageGBHours;
-                }
-            }
-            
-            if ($totalStorageGBHours > 0) {
-                $storageCharge = $totalStorageGBHours * $rates['storage_per_gb_hour'];
-                $totalCharge += $storageCharge;
-                $chargeDetails[] = sprintf(
-                    "Storage: %.2f GB-hours × $%.2f = $%.2f",
-                    $totalStorageGBHours,
-                    $rates['storage_per_gb_hour'],
-                    $storageCharge
-                );
-                $debugInfo['storage']['total_gb_hours'] = $totalStorageGBHours;
-                $debugInfo['storage']['total_charge'] = $storageCharge;
-            }
-        }
-
-        // Process Backup Storage charges if exists
-        if (isset($usage['usage_breakdown']['backup_storage']) && 
-            is_array($usage['usage_breakdown']['backup_storage']) &&
-            count($usage['usage_breakdown']['backup_storage']) > 0) {
-            $totalBackupGBHours = 0;
-            
-            foreach ($usage['usage_breakdown']['backup_storage'] as $backupName => $backupData) {
-                if (isset($backupData['total_usage']) && isset($backupData['uptime']) && $backupData['uptime'] > 0) {
-                    // Convert byte-seconds to GB-hours
-                    $backupGBHours = ($backupData['total_usage'] / (1024 * 1024 * 1024)) / 3600;
-                    $totalBackupGBHours += $backupGBHours;
-                }
-            }
-            
-            if ($totalBackupGBHours > 0) {
-                $backupCharge = $totalBackupGBHours * $rates['storage_per_gb_hour'];
-                $totalCharge += $backupCharge;
-                $chargeDetails[] = sprintf(
-                    "Backup Storage: %.2f GB-hours × $%.2f = $%.2f",
-                    $totalBackupGBHours,
-                    $rates['storage_per_gb_hour'],
-                    $backupCharge
-                );
-            }
-        }
-
-        // Create separate billable items for each resource type
-        $billableItems = [];
-        $billingPeriodHash = md5($billingStart->format('Y-m-d') . '-' . $billingEnd->format('Y-m-d'));
-        
-        // Prepare billable items for each resource type
-        if (isset($debugInfo['cpu']) && $debugInfo['cpu']['charge'] > 0) {
-            $billableItems[] = [
-                'description' => sprintf(
-                    "PAYG CPU Usage - %s\nPeriod: %s\nUsage: %.2f core-hours @ $%.2f/hour\n[Period: %s]",
-                    $params['domain'],
-                    $periodDescription,
-                    $debugInfo['cpu']['hours'],
-                    $rates['cpu_per_hour'],
-                    $billingPeriodHash
-                ),
-                'amount' => round($debugInfo['cpu']['charge'], 2),
-                'qty' => round($debugInfo['cpu']['hours'], 2),
-                'unit' => 'hours'
-            ];
-        }
-        
-        if (isset($debugInfo['memory']) && $debugInfo['memory']['charge'] > 0) {
-            $billableItems[] = [
-                'description' => sprintf(
-                    "PAYG Memory Usage - %s\nPeriod: %s\nUsage: %.2f GB-hours @ $%.2f/GB-hour\n[Period: %s]",
-                    $params['domain'],
-                    $periodDescription,
-                    $debugInfo['memory']['gb_hours'],
-                    $rates['memory_per_gb_hour'],
-                    $billingPeriodHash
-                ),
-                'amount' => round($debugInfo['memory']['charge'], 2),
-                'qty' => round($debugInfo['memory']['gb_hours'], 2),
-                'unit' => 'hours'
-            ];
-        }
-        
-        // Storage items - one for each storage policy
-        if (isset($debugInfo['storage']) && is_array($debugInfo['storage'])) {
-            foreach ($debugInfo['storage'] as $storageName => $storageInfo) {
-                if ($storageName !== 'total_gb_hours' && $storageName !== 'total_charge' && 
-                    isset($storageInfo['gb_hours']) && $storageInfo['gb_hours'] > 0) {
-                    $storageCharge = $storageInfo['gb_hours'] * $rates['storage_per_gb_hour'];
-                    $billableItems[] = [
-                        'description' => sprintf(
-                            "PAYG Storage Usage (%s) - %s\nPeriod: %s\nUsage: %.2f GB-hours @ $%.2f/GB-hour\n[Period: %s]",
-                            $storageName,
-                            $params['domain'],
-                            $periodDescription,
-                            $storageInfo['gb_hours'],
-                            $rates['storage_per_gb_hour'],
-                            $billingPeriodHash
-                        ),
-                        'amount' => round($storageCharge, 2),
-                        'qty' => round($storageInfo['gb_hours'], 2),
-                        'unit' => 'hours'
-                    ];
-                }
-            }
-        }
-        
-        // Create billable items if there are any
-        if (count($billableItems) > 0) {
-            $createdItems = 0;
-            $failedItems = [];
-            
-            // Check if localAPI function exists
-            if (!function_exists('localAPI')) {
-                throw new Exception('WHMCS localAPI function not available. Please ensure this module is running within WHMCS.');
-            }
-            
-            foreach ($billableItems as $item) {
-                try {
-                    // Check for duplicates by searching description for period hash
-                    $existingItems = Capsule::table('tblbillableitems')
-                        ->where('userid', $params['userid'])
-                        ->where('description', 'LIKE', '%[Period: ' . $billingPeriodHash . ']%')
-                        ->where('description', 'LIKE', '%' . explode(' - ', $item['description'])[0] . '%')
-                        ->count();
-                    
-                    if ($existingItems > 0) {
-                        multiportal_log('SyncUsageAndBill', [
-                            'skipped' => true,
-                            'reason' => 'Duplicate item for period',
-                            'description' => explode("\n", $item['description'])[0]
-                        ], 'Skipped duplicate billable item');
-                        continue;
-                    }
-                    
-                    $command = 'AddBillableItem';
-                    $postData = array(
-                        'clientid' => $params['userid'],
-                        'description' => $item['description'],
-                        'amount' => $item['amount'],
-                        'unit' => $item['unit'],
-                        'qty' => $item['qty'],
-                        'invoiceaction' => 'nextinvoice',
-                        'recur' => 0,
-                        'duedate' => $currentDate->format('Y-m-d')
-                    );
-                    
-                    $results = localAPI($command, $postData);
-                    
-                    if ($results['result'] === 'success') {
-                        $createdItems++;
-                        multiportal_log('SyncUsageAndBill', [
-                            'billableItemId' => $results['billableitemid'] ?? null,
-                            'description' => explode("\n", $item['description'])[0],
-                            'amount' => $item['amount'],
-                            'qty' => $item['qty']
-                        ], 'Created billable item');
-                    } else {
-                        $failedItems[] = explode("\n", $item['description'])[0] . ' - Error: ' . ($results['message'] ?? 'Unknown');
-                    }
-                } catch (Exception $e) {
-                    $failedItems[] = explode("\n", $item['description'])[0] . ' - Error: ' . $e->getMessage();
-                }
-            }
-            
-            multiportal_log('SyncUsageAndBill', [
-                'vdcId' => $vdcId,
-                'totalCharge' => $totalCharge,
-                'createdItems' => $createdItems,
-                'failedItems' => count($failedItems)
-            ], 'Billable items creation summary');
-            
-            if (count($failedItems) > 0) {
-                throw new Exception('Some billable items failed to create: ' . implode('; ', $failedItems));
-            }
-        }
-
-        // Update last sync date
-        Capsule::table('tblcustomfieldsvalues')->updateOrInsert(
-            [
-                'fieldid' => $lastSyncFieldId,
-                'relid' => $params['serviceid']
-            ],
-            [
-                'value' => $billingEnd->format('Y-m-d H:i:s')
-            ]
+        // ── Process usage and create billable items ─────────────
+        $result = multiportal_processVDCUsage(
+            $usage, $vdcId, $vdcName,
+            $billingStart, $billingEnd,
+            $rates, $params['serviceid'], $params['userid'],
+            $billingStart  // Re-bill controls its own range
         );
 
-        // Log debug info
-        multiportal_log('SyncUsageAndBill_Results', [
-            'totalCharge' => $totalCharge,
-            'chargeDetails' => $chargeDetails,
-            'debugInfo' => $debugInfo
-        ], 'Calculation results');
+        // ── Update Last Usage Sync ──────────────────────────────
+        $productId = Capsule::table('tblhosting')
+            ->where('id', $params['serviceid'])
+            ->value('packageid');
+        ensureProductCustomFields($productId);
 
-        // Prepare success message
-        $message = "PAYG Usage Sync Completed\n\n";
-        $message .= $periodDescription . "\n\n";
-
-        if (isset($createdItems) && $createdItems > 0) {
-            $message .= "Created " . $createdItems . " billable item(s):\n\n";
-            
-            // Show individual resource charges
-            if (!empty($chargeDetails)) {
-                foreach ($chargeDetails as $detail) {
-                    $message .= "• " . $detail . "\n";
-                }
-                $message .= "\n";
-            }
-            
-            $message .= "Total Charges: $" . number_format($totalCharge, 2) . "\n\n";
-            $message .= "These items will appear on the next invoice.\n";
-            
-            if (isset($existingItems) && $existingItems > 0) {
-                $message .= "\nNote: Some items were skipped as they were already billed for this period.";
-            }
-        } elseif ($totalCharge > 0) {
-            $message .= "Usage detected but no new billable items created.\n";
-            $message .= "This may be because items for this period already exist.\n\n";
-            $message .= "Calculated charges:\n" . implode("\n", $chargeDetails);
-        } else {
-            $message .= "No usage charges for this period.\n\n";
-            $message .= "Debug Info:\n";
-            $message .= "- Has usage summary: " . (isset($usage['summary']['usage_summary']) ? 'Yes' : 'No') . "\n";
-            $message .= "- Has storage data: " . (isset($usage['usage_breakdown']['storage']) ? 'Yes' : 'No') . "\n";
-            if (isset($debugInfo['usage_summary'])) {
-                $message .= "- Total CPU usage: " . ($debugInfo['usage_summary']['total_cpu_usage'] ?? 0) . " seconds\n";
-                $message .= "- Total Memory usage: " . ($debugInfo['usage_summary']['total_memory_usage'] ?? 0) . " byte-seconds\n";
-            }
+        $syncField = Capsule::table('tblcustomfields')
+            ->where('type', 'product')
+            ->where('fieldname', 'Last Usage Sync')
+            ->where('relid', $productId)
+            ->first();
+        if (!$syncField) {
+            $syncField = Capsule::table('tblcustomfields')
+                ->where('type', 'product')
+                ->where('fieldname', 'Last Usage Sync')
+                ->where('relid', 0)
+                ->first();
+        }
+        if ($syncField) {
+            Capsule::table('tblcustomfieldsvalues')->updateOrInsert(
+                ['fieldid' => $syncField->id, 'relid' => $params['serviceid']],
+                ['value'   => $billingEnd->format('Y-m-d H:i:s')]
+            );
         }
 
-        // Update service notes
-        $notes = "=== PAYG Usage Sync (Last Updated: " . date('Y-m-d H:i:s') . ") ===\n" . $message;
-        Capsule::table('tblhosting')
-            ->where('id', $params['serviceid'])
-            ->update(['notes' => $notes]);
+        // ── Write details to admin notes ─────────────────────────
+        $period = $billingStart->format('Y-m-d H:i') . ' to ' . $billingEnd->format('Y-m-d H:i');
 
-        return $message;
+        $noteLines = ["Re-bill PAYG | Period: {$period}"];
+        $noteLines[] = "Prev Last Usage Sync: " . ($prevSyncValue ?: '(not set)');
+        $noteLines[] = "New Last Usage Sync: " . $billingEnd->format('Y-m-d H:i:s');
+        if ($cleanup['deleted'] > 0) {
+            $noteLines[] = "Deleted {$cleanup['deleted']} uninvoiced item(s) before re-billing";
+        }
+        foreach ($result['details'] as $detail) {
+            $noteLines[] = $detail;
+        }
+        if ($result['items_created'] > 0) {
+            $noteLines[] = "Total: \$" . number_format($result['total_charge'], 2)
+                . " ({$result['items_created']} items) — will appear on next invoice";
+        } else {
+            $noteLines[] = "No billable usage for this period";
+        }
+        multiportal_appendAdminNote($params['serviceid'], implode(' | ', $noteLines));
+
+        return 'success';
     } catch (Exception $e) {
-        multiportal_log('SyncUsageAndBill', $params, ['error' => $e->getMessage()]);
+        multiportal_log('RebillPAYGUsage', $params, ['error' => $e->getMessage()]);
+        multiportal_appendAdminNote($params['serviceid'],
+            "Re-bill PAYG ERROR: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
 }
 
+// ── PAYG Incremental Billing Functions ────────────────────────────────
+// Shared between bill-usage.php (cron) and the admin "Re-bill PAYG Usage" button.
+
+/**
+ * Parse a MultiPortal API history timestamp into a DateTime.
+ *
+ * The API returns timestamps like "Feb 10, 2026 10:00:00 AM".
+ *
+ * @param string $timestamp
+ * @return DateTime|null
+ */
+function multiportal_parseHistoryTimestamp($timestamp)
+{
+    $dt = DateTime::createFromFormat('M j, Y g:i:s A', trim($timestamp));
+    if (!$dt) {
+        $dt = DateTime::createFromFormat('M d, Y g:i:s A', trim($timestamp));
+    }
+    return $dt ?: null;
+}
+
+/**
+ * Load PAYG rates with fallback chain: product config → payg_config.php → defaults.
+ *
+ * @param object $productRow  DB row with configoption4/5/6
+ * @return array  ['cpu_per_hour' => float, 'memory_per_gb_hour' => float, 'storage_per_gb_hour' => float, 'backup_storage_per_gb_hour' => float, 'iso_storage_per_gb_hour' => float]
+ */
+function multiportal_loadPAYGRates($productRow)
+{
+    // Hardcoded defaults (lowest priority)
+    $rates = [
+        'cpu_per_hour'                  => 0.10,
+        'memory_per_gb_hour'            => 0.05,
+        'storage_per_gb_hour'           => 0.01,
+        'backup_storage_per_gb_hour'    => 0.01,
+        'iso_storage_per_gb_hour'       => 0.01,
+    ];
+
+    // payg_config.php overrides
+    $configFile = @include __DIR__ . '/payg_config.php';
+    if (is_array($configFile) && isset($configFile['rates'])) {
+        $rates = array_merge($rates, $configFile['rates']);
+    }
+
+    // Product-level overrides (highest priority)
+    if (!empty($productRow->configoption4) && is_numeric($productRow->configoption4)) {
+        $rates['cpu_per_hour'] = (float) $productRow->configoption4;
+    }
+    if (!empty($productRow->configoption5) && is_numeric($productRow->configoption5)) {
+        $rates['memory_per_gb_hour'] = (float) $productRow->configoption5;
+    }
+    if (!empty($productRow->configoption6) && is_numeric($productRow->configoption6)) {
+        $rates['storage_per_gb_hour'] = (float) $productRow->configoption6;
+    }
+
+    // Backup/ISO: if product config is blank, fall back to whatever storage rate resolved to
+    if (!empty($productRow->configoption8) && is_numeric($productRow->configoption8)) {
+        $rates['backup_storage_per_gb_hour'] = (float) $productRow->configoption8;
+    } else {
+        $rates['backup_storage_per_gb_hour'] = $rates['storage_per_gb_hour'];
+    }
+    if (!empty($productRow->configoption9) && is_numeric($productRow->configoption9)) {
+        $rates['iso_storage_per_gb_hour'] = (float) $productRow->configoption9;
+    } else {
+        $rates['iso_storage_per_gb_hour'] = $rates['storage_per_gb_hour'];
+    }
+
+    return $rates;
+}
+
+/**
+ * Process a single VDC's usage data and create billable items.
+ *
+ * Accepts pre-fetched usage data (with include_history=true) and filters
+ * historical entries by the VDC's Last Sync Date. Creates one billable item
+ * per resource type (CPU, RAM, storage policy, backup, ISO) via AddBillableItem.
+ *
+ * Does NOT update Last Usage Sync — the caller is responsible for that.
+ *
+ * @param array    $usageData     API response data from getVDCUsage with include_history=true
+ * @param string   $vdcId         VDC UUID
+ * @param string   $vdcName       VDC display name (e.g. domain from tblhosting)
+ * @param DateTime $lastSyncDate  Only bill entries with timestamp >= this
+ * @param DateTime $billingEnd    End of billing period (typically now())
+ * @param array    $rates         Rate array from multiportal_loadPAYGRates
+ * @param int      $serviceId     WHMCS service ID
+ * @param int      $userId        WHMCS client ID
+ * @return array   ['items_created' => int, 'total_charge' => float, 'details' => string[]]
+ */
+function multiportal_processVDCUsage($usageData, $vdcId, $vdcName, DateTime $lastSyncDate, DateTime $billingEnd, array $rates, $serviceId, $userId, DateTime $todayStart = null)
+{
+    $result = ['items_created' => 0, 'total_charge' => 0.0, 'details' => []];
+    $breakdown = $usageData['usage_breakdown'] ?? [];
+    $GiB = 1024 * 1024 * 1024;
+
+    // Helper: format charge (6 decimals, strip trailing zeros — but always keep 6 for $0)
+    $fmtCharge = function ($v) {
+        if ((float) $v == 0) return '$0.000000';
+        return '$' . rtrim(rtrim(number_format($v, 6, '.', ''), '0'), '.');
+    };
+
+    // ── Helper: parse timestamp and return [day_bucket_key, hour] ──
+    // Mirrors mp-gen-usage.sh SLICE=10 (YYYY-MM-DD) — daily buckets
+    // Uses $todayFilter for today's entries, $lastSyncDate for completed days
+    $todayStr = date('Y-m-d');
+    $todayFilter = $todayStart ?? $lastSyncDate;
+
+    $getBucket = function ($timestamp) use ($lastSyncDate, $todayStr, $todayFilter) {
+        $ts = multiportal_parseHistoryTimestamp($timestamp);
+        if (!$ts) return [null, null];
+        $dayKey = $ts->format('Y-m-d');
+        $filterDate = ($dayKey === $todayStr) ? $todayFilter : $lastSyncDate;
+        if ($ts < $filterDate) return [null, null];
+        return [$dayKey, (int) $ts->format('G')];
+    };
+
+    // ── Step 1: Collect all entries into daily buckets ──
+    // Each bucket tracks billing totals + per-VM/per-policy detail for summaries
+    $newBucket = function () {
+        return [
+            'cpu_hours' => 0, 'mem_gb_hours' => 0,
+            'storage' => [], 'backup' => [], 'iso' => [],
+            // Per-VM compute detail: vm_name => [vcpus, ram_gb, duration_s, cpu_duration, mem_gb_duration]
+            'vm_compute' => [],
+            // Per-policy storage detail: policy => [duration_s, usage_bytes_sum, entry_count]
+            'storage_detail' => [],
+            // Per-target backup/iso detail: target => [duration_s, usage_bytes_sum, entry_count]
+            'backup_detail' => [], 'iso_detail' => [],
+            // Track which hours (0-23) have data entries
+            'hours_seen' => [],
+        ];
+    };
+    $dailyBuckets = [];
+
+    // Resource entries (CPU + RAM) — also track per-VM
+    if (isset($breakdown['resource']['historical_data']) && is_array($breakdown['resource']['historical_data'])) {
+        foreach ($breakdown['resource']['historical_data'] as $entry) {
+            [$bucket, $entryHour] = $getBucket($entry['timestamp'] ?? '');
+            if ($bucket === null) continue;
+            if (!isset($dailyBuckets[$bucket])) $dailyBuckets[$bucket] = $newBucket();
+            $dailyBuckets[$bucket]['hours_seen'][$entryHour] = true;
+            $cpu      = (float) ($entry['cpu'] ?? 0);
+            $memBytes = (float) ($entry['memory'] ?? 0);
+            $duration = (float) ($entry['duration'] ?? 0);
+            $vmName   = $entry['name'] ?? 'unknown';
+            $dailyBuckets[$bucket]['cpu_hours']   += ($cpu * $duration) / 3600;
+            $dailyBuckets[$bucket]['mem_gb_hours'] += ($memBytes / $GiB) * $duration / 3600;
+            // Per-VM detail
+            if (!isset($dailyBuckets[$bucket]['vm_compute'][$vmName])) {
+                $dailyBuckets[$bucket]['vm_compute'][$vmName] = [
+                    'vcpus' => $cpu, 'ram_gb' => round($memBytes / $GiB, 2),
+                    'duration_s' => 0, 'cpu_duration' => 0, 'mem_gb_duration' => 0,
+                ];
+            }
+            $vm = &$dailyBuckets[$bucket]['vm_compute'][$vmName];
+            $vm['duration_s']      += $duration;
+            $vm['cpu_duration']    += $cpu * $duration;
+            $vm['mem_gb_duration'] += ($memBytes / $GiB) * $duration;
+            unset($vm);
+        }
+    }
+
+    // Storage entries (per policy) — also track detail
+    if (isset($breakdown['storage']) && is_array($breakdown['storage'])) {
+        foreach ($breakdown['storage'] as $policyName => $policyData) {
+            if (!isset($policyData['historical_data']) || !is_array($policyData['historical_data'])) continue;
+            foreach ($policyData['historical_data'] as $entry) {
+                [$bucket, $entryHour] = $getBucket($entry['timestamp'] ?? '');
+                if ($bucket === null) continue;
+                if (!isset($dailyBuckets[$bucket])) $dailyBuckets[$bucket] = $newBucket();
+                $dailyBuckets[$bucket]['hours_seen'][$entryHour] = true;
+                $usage    = (float) ($entry['usage'] ?? 0);
+                $duration = (float) ($entry['duration'] ?? 0);
+                if (!isset($dailyBuckets[$bucket]['storage'][$policyName])) $dailyBuckets[$bucket]['storage'][$policyName] = 0;
+                $dailyBuckets[$bucket]['storage'][$policyName] += ($usage / $GiB) * $duration / 3600;
+                if (!isset($dailyBuckets[$bucket]['storage_detail'][$policyName])) {
+                    $dailyBuckets[$bucket]['storage_detail'][$policyName] = ['duration_s' => 0, 'usage_bytes_sum' => 0, 'entry_count' => 0];
+                }
+                $dailyBuckets[$bucket]['storage_detail'][$policyName]['duration_s']      += $duration;
+                $dailyBuckets[$bucket]['storage_detail'][$policyName]['usage_bytes_sum']  += $usage;
+                $dailyBuckets[$bucket]['storage_detail'][$policyName]['entry_count']++;
+            }
+        }
+    }
+
+    // Backup storage entries (per target)
+    if (isset($breakdown['backup_storage']) && is_array($breakdown['backup_storage'])) {
+        foreach ($breakdown['backup_storage'] as $targetName => $targetData) {
+            if (!isset($targetData['historical_data']) || !is_array($targetData['historical_data'])) continue;
+            foreach ($targetData['historical_data'] as $entry) {
+                [$bucket, $entryHour] = $getBucket($entry['timestamp'] ?? '');
+                if ($bucket === null) continue;
+                if (!isset($dailyBuckets[$bucket])) $dailyBuckets[$bucket] = $newBucket();
+                $dailyBuckets[$bucket]['hours_seen'][$entryHour] = true;
+                $usage    = (float) ($entry['usage'] ?? 0);
+                $duration = (float) ($entry['duration'] ?? 0);
+                if (!isset($dailyBuckets[$bucket]['backup'][$targetName])) $dailyBuckets[$bucket]['backup'][$targetName] = 0;
+                $dailyBuckets[$bucket]['backup'][$targetName] += ($usage / $GiB) * $duration / 3600;
+                if (!isset($dailyBuckets[$bucket]['backup_detail'][$targetName])) {
+                    $dailyBuckets[$bucket]['backup_detail'][$targetName] = ['duration_s' => 0, 'usage_bytes_sum' => 0, 'entry_count' => 0];
+                }
+                $dailyBuckets[$bucket]['backup_detail'][$targetName]['duration_s']      += $duration;
+                $dailyBuckets[$bucket]['backup_detail'][$targetName]['usage_bytes_sum']  += $usage;
+                $dailyBuckets[$bucket]['backup_detail'][$targetName]['entry_count']++;
+            }
+        }
+    }
+
+    // ISO storage entries (per target)
+    if (isset($breakdown['iso_storage']) && is_array($breakdown['iso_storage'])) {
+        foreach ($breakdown['iso_storage'] as $targetName => $targetData) {
+            if (!isset($targetData['historical_data']) || !is_array($targetData['historical_data'])) continue;
+            foreach ($targetData['historical_data'] as $entry) {
+                [$bucket, $entryHour] = $getBucket($entry['timestamp'] ?? '');
+                if ($bucket === null) continue;
+                if (!isset($dailyBuckets[$bucket])) $dailyBuckets[$bucket] = $newBucket();
+                $dailyBuckets[$bucket]['hours_seen'][$entryHour] = true;
+                $usage    = (float) ($entry['usage'] ?? 0);
+                $duration = (float) ($entry['duration'] ?? 0);
+                if (!isset($dailyBuckets[$bucket]['iso'][$targetName])) $dailyBuckets[$bucket]['iso'][$targetName] = 0;
+                $dailyBuckets[$bucket]['iso'][$targetName] += ($usage / $GiB) * $duration / 3600;
+                if (!isset($dailyBuckets[$bucket]['iso_detail'][$targetName])) {
+                    $dailyBuckets[$bucket]['iso_detail'][$targetName] = ['duration_s' => 0, 'usage_bytes_sum' => 0, 'entry_count' => 0];
+                }
+                $dailyBuckets[$bucket]['iso_detail'][$targetName]['duration_s']      += $duration;
+                $dailyBuckets[$bucket]['iso_detail'][$targetName]['usage_bytes_sum']  += $usage;
+                $dailyBuckets[$bucket]['iso_detail'][$targetName]['entry_count']++;
+            }
+        }
+    }
+
+    if (empty($dailyBuckets)) {
+        return $result;
+    }
+
+    // ── Step 2: Sort by day and create one billable item per bucket ──
+    ksort($dailyBuckets);
+
+    // Running totals for admin notes
+    $totalCpuHours = 0;
+    $totalMemGBHours = 0;
+    $totalStorageGBHours = [];
+    $totalBackupGBHours = [];
+    $totalIsoGBHours = [];
+
+    foreach ($dailyBuckets as $bucket => $data) {
+        // Calculate charges for this day
+        $cpuCharge     = $data['cpu_hours'] * $rates['cpu_per_hour'];
+        $memCharge     = $data['mem_gb_hours'] * $rates['memory_per_gb_hour'];
+        $storageCharge = 0;
+        foreach ($data['storage'] as $gbh) { $storageCharge += $gbh * $rates['storage_per_gb_hour']; }
+        $backupCharge  = 0;
+        foreach ($data['backup'] as $gbh) { $backupCharge += $gbh * $rates['backup_storage_per_gb_hour']; }
+        $isoCharge     = 0;
+        foreach ($data['iso'] as $gbh) { $isoCharge += $gbh * $rates['iso_storage_per_gb_hour']; }
+
+        $dayTotalRaw = $cpuCharge + $memCharge + $storageCharge + $backupCharge + $isoCharge;
+        $dayTotal = round($dayTotalRaw, 2);
+        if ($dayTotal <= 0) continue;
+
+        // Day period strings — today uses $todayFilter start time, completed days use midnight
+        $dayStartTime = ($bucket === $todayStr) ? $todayFilter->format('H:i:s') : '00:00:00';
+        $dayStart    = $bucket . ' ' . $dayStartTime;
+        $dayEnd      = ($bucket === $todayStr) ? $billingEnd->format('H:i:s') : '23:59:59';
+        $dayHash     = md5($vdcId . ':' . $dayStart);
+        $hoursCount  = count($data['hours_seen']);
+
+        // Calculate day N of M in the month
+        $bucketDt    = new DateTime($dayStart);
+        $dayNum      = (int) $bucketDt->format('j');  // day of month 1-based
+        $daysInMonth = (int) $bucketDt->format('t');
+        $monthName   = $bucketDt->format('F');
+
+        // ── Build description ──
+        $lines = [];
+        $lines[] = sprintf("== VDC DAILY USAGE == [%s]", $dayHash);
+        $lines[] = sprintf("Period: %s - %s (%d h)", $dayStart, $dayEnd, $hoursCount);
+        $lines[] = sprintf("- Day %d/%d in %s", $dayNum, $daysInMonth, $monthName);
+        $lines[] = '';
+        $lines[] = sprintf("VDC: %s (%s)", $vdcName, $vdcId);
+        $lines[] = '';
+
+        // USAGE SUMMARY
+        $lines[] = 'USAGE SUMMARY';
+        $lines[] = str_repeat('=', 13);
+        if ($data['cpu_hours'] > 0) {
+            $lines[] = sprintf("- CPU: %.2f core-hours @ \$%.4f/hour = %s", $data['cpu_hours'], $rates['cpu_per_hour'], $fmtCharge($cpuCharge));
+        }
+        if ($data['mem_gb_hours'] > 0) {
+            $lines[] = sprintf("- RAM: %.2f GB-hours @ \$%.4f/GB-hour = %s", $data['mem_gb_hours'], $rates['memory_per_gb_hour'], $fmtCharge($memCharge));
+        }
+        foreach ($data['storage'] as $policy => $gbh) {
+            if ($gbh > 0) {
+                $lines[] = sprintf("- Storage Policy (%s): %.2f GB-hours @ \$%.4f/GB-hour = %s", $policy, $gbh, $rates['storage_per_gb_hour'], $fmtCharge($gbh * $rates['storage_per_gb_hour']));
+            }
+        }
+        foreach ($data['backup'] as $target => $gbh) {
+            if ($gbh > 0) {
+                $lines[] = sprintf("- Backup Target (%s): %.2f GB-hours @ \$%.4f/GB-hour = %s", $target, $gbh, $rates['backup_storage_per_gb_hour'], $fmtCharge($gbh * $rates['backup_storage_per_gb_hour']));
+            }
+        }
+        foreach ($data['iso'] as $target => $gbh) {
+            if ($gbh > 0) {
+                $lines[] = sprintf("- ISO Target (%s): %.2f GB-hours @ \$%.4f/GB-hour = %s", $target, $gbh, $rates['iso_storage_per_gb_hour'], $fmtCharge($gbh * $rates['iso_storage_per_gb_hour']));
+            }
+        }
+        $lines[] = str_repeat('=', 13);
+        $lines[] = sprintf("=> %s", $fmtCharge($dayTotalRaw));
+
+        // DAILY COMPUTE DETAIL
+        if (!empty($data['vm_compute'])) {
+            $lines[] = '';
+            $lines[] = 'DAILY COMPUTE DETAIL';
+            $lines[] = str_repeat('=', 20);
+            $computeTotal = 0;
+            $vmIdx = 0;
+            foreach ($data['vm_compute'] as $vm => $vc) {
+                $runtimeH   = round($vc['duration_s'] / 3600, 2);
+                $cpuCoreH   = round($vc['cpu_duration'] / 3600, 2);
+                $memGBH     = round($vc['mem_gb_duration'] / 3600, 2);
+                $avgCpu     = ($vc['duration_s'] > 0) ? round($vc['cpu_duration'] / $vc['duration_s'], 2) : 0;
+                $avgRamGB   = ($vc['duration_s'] > 0) ? round($vc['mem_gb_duration'] / $vc['duration_s'], 2) : 0;
+                $vmCharge   = ($cpuCoreH * $rates['cpu_per_hour']) + ($memGBH * $rates['memory_per_gb_hour']);
+                $computeTotal += $vmCharge;
+                if ($vmIdx > 0) $lines[] = '';
+                $lines[] = sprintf("%s:", $vm);
+                $lines[] = sprintf("- %d vCPUs (%.2f avg), %.2f GB RAM (%.2f avg)", $vc['vcpus'], $avgCpu, $vc['ram_gb'], $avgRamGB);
+                $lines[] = sprintf("- %.2f run-hours, %.2f core-hours, %.2f GB-hours] = %s", $runtimeH, $cpuCoreH, $memGBH, $fmtCharge($vmCharge));
+                $vmIdx++;
+            }
+            $lines[] = str_repeat('=', 20);
+            $lines[] = sprintf("=> %s", $fmtCharge($computeTotal));
+        }
+
+        // DAILY STORAGE DETAIL
+        if (!empty($data['storage_detail'])) {
+            $lines[] = '';
+            $lines[] = 'DAILY STORAGE DETAIL';
+            $lines[] = str_repeat('=', 20);
+            $storageDetailTotal = 0;
+            $sIdx = 0;
+            foreach ($data['storage_detail'] as $policy => $sd) {
+                $durH    = round($sd['duration_s'] / 3600, 2);
+                $avgGB   = round(($sd['usage_bytes_sum'] / $sd['entry_count']) / $GiB, 2);
+                $gbH     = $data['storage'][$policy] ?? 0;
+                $policyCharge = $gbH * $rates['storage_per_gb_hour'];
+                $storageDetailTotal += $policyCharge;
+                if ($sIdx > 0) $lines[] = '';
+                $lines[] = sprintf("%s:", $policy);
+                $lines[] = sprintf("- %.2f duration-hours, %.2f GB (avg), %.2f GB-hours = %s", $durH, $avgGB, round($gbH, 2), $fmtCharge($policyCharge));
+                $sIdx++;
+            }
+            $lines[] = str_repeat('=', 20);
+            $lines[] = sprintf("=> %s", $fmtCharge($storageDetailTotal));
+        }
+
+        // DAILY BACKUP STORAGE DETAIL
+        if (!empty($data['backup_detail'])) {
+            $lines[] = '';
+            $lines[] = 'DAILY BACKUP STORAGE DETAIL';
+            $lines[] = str_repeat('=', 27);
+            $backupDetailTotal = 0;
+            foreach ($data['backup_detail'] as $target => $bd) {
+                $durH    = round($bd['duration_s'] / 3600, 2);
+                $avgGB   = round(($bd['usage_bytes_sum'] / $bd['entry_count']) / $GiB, 2);
+                $gbH     = $data['backup'][$target] ?? 0;
+                $targetCharge = $gbH * $rates['backup_storage_per_gb_hour'];
+                $backupDetailTotal += $targetCharge;
+                $lines[] = sprintf("%s:", $target);
+                $lines[] = sprintf("- %.2f duration-hours, %.2f GB (avg), %.2f GB-hours = %s", $durH, $avgGB, round($gbH, 2), $fmtCharge($targetCharge));
+            }
+            $lines[] = str_repeat('=', 27);
+            $lines[] = sprintf("=> %s", $fmtCharge($backupDetailTotal));
+        }
+
+        // DAILY ISO STORAGE DETAIL
+        if (!empty($data['iso_detail'])) {
+            $lines[] = '';
+            $lines[] = 'DAILY ISO STORAGE DETAIL';
+            $lines[] = str_repeat('=', 24);
+            $isoDetailTotal = 0;
+            foreach ($data['iso_detail'] as $target => $id) {
+                $durH    = round($id['duration_s'] / 3600, 2);
+                $avgGB   = round(($id['usage_bytes_sum'] / $id['entry_count']) / $GiB, 2);
+                $gbH     = $data['iso'][$target] ?? 0;
+                $targetCharge = $gbH * $rates['iso_storage_per_gb_hour'];
+                $isoDetailTotal += $targetCharge;
+                $lines[] = sprintf("%s:", $target);
+                $lines[] = sprintf("- %.2f duration-hours, %.2f GB (avg), %.2f GB-hours = %s", $durH, $avgGB, round($gbH, 2), $fmtCharge($targetCharge));
+            }
+            $lines[] = str_repeat('=', 24);
+            $lines[] = sprintf("=> %s", $fmtCharge($isoDetailTotal));
+        }
+
+        $lines[] = '';
+        $lines[] = str_repeat('=', 60);
+
+        $desc = implode("\n", $lines);
+
+        // ── Dedup / live-update logic ──
+        // Look for existing uninvoiced item for this VDC+date
+        $uninvoicedItem = Capsule::table('tblbillableitems')
+            ->where('userid', $userId)
+            ->where('invoicecount', 0)
+            ->where('duedate', $bucket)
+            ->where('description', 'LIKE', '%(' . $vdcId . ')%')
+            ->first();
+
+        if ($uninvoicedItem) {
+            if ($bucket === $todayStr) {
+                // Today's live item — UPDATE in place (no ID churn)
+                Capsule::table('tblbillableitems')
+                    ->where('id', $uninvoicedItem->id)
+                    ->update(['description' => $desc, 'amount' => $dayTotal]);
+                $result['items_created']++;
+                $result['total_charge'] += $dayTotal;
+            }
+            // Whether today (updated) or completed day (unchanged) — skip INSERT
+            // Accumulate totals below then continue
+            $totalCpuHours += $data['cpu_hours'];
+            $totalMemGBHours += $data['mem_gb_hours'];
+            foreach ($data['storage'] as $p => $gbh) {
+                if (!isset($totalStorageGBHours[$p])) $totalStorageGBHours[$p] = 0;
+                $totalStorageGBHours[$p] += $gbh;
+            }
+            foreach ($data['backup'] as $t => $gbh) {
+                if (!isset($totalBackupGBHours[$t])) $totalBackupGBHours[$t] = 0;
+                $totalBackupGBHours[$t] += $gbh;
+            }
+            foreach ($data['iso'] as $t => $gbh) {
+                if (!isset($totalIsoGBHours[$t])) $totalIsoGBHours[$t] = 0;
+                $totalIsoGBHours[$t] += $gbh;
+            }
+            continue;
+        }
+
+        // No uninvoiced item — check for invoiced item on completed days
+        if ($bucket !== $todayStr) {
+            $invoicedExists = Capsule::table('tblbillableitems')
+                ->where('userid', $userId)
+                ->where('invoicecount', '>', 0)
+                ->where('duedate', $bucket)
+                ->where('description', 'LIKE', '%(' . $vdcId . ')%')
+                ->exists();
+            if ($invoicedExists) {
+                continue;  // Already invoiced — skip
+            }
+        }
+
+        // INSERT new item (first time for this day, OR post-invoice continuation for today)
+        $apiParams = [
+            'clientid'      => $userId,
+            'description'   => $desc,
+            'amount'        => $dayTotal,
+            'unit'          => 'quantity',
+            'quantity'      => 1,
+            'invoiceaction' => 'nextinvoice',
+            'recur'         => 0,
+            'duedate'       => $bucket,
+        ];
+        $apiResult = localAPI('AddBillableItem', $apiParams);
+        if (isset($apiResult['result']) && $apiResult['result'] === 'success') {
+            $result['items_created']++;
+            $result['total_charge'] += $dayTotal;
+        } else {
+            $error = $apiResult['message'] ?? 'Unknown error';
+            logActivity("MultiPortal PAYG: AddBillableItem failed for client {$userId}: {$error}");
+            $result['details'][] = "ERROR creating item for {$bucket}: {$error}";
+        }
+
+        // Accumulate totals for admin notes
+        $totalCpuHours += $data['cpu_hours'];
+        $totalMemGBHours += $data['mem_gb_hours'];
+        foreach ($data['storage'] as $p => $gbh) {
+            if (!isset($totalStorageGBHours[$p])) $totalStorageGBHours[$p] = 0;
+            $totalStorageGBHours[$p] += $gbh;
+        }
+        foreach ($data['backup'] as $t => $gbh) {
+            if (!isset($totalBackupGBHours[$t])) $totalBackupGBHours[$t] = 0;
+            $totalBackupGBHours[$t] += $gbh;
+        }
+        foreach ($data['iso'] as $t => $gbh) {
+            if (!isset($totalIsoGBHours[$t])) $totalIsoGBHours[$t] = 0;
+            $totalIsoGBHours[$t] += $gbh;
+        }
+    }
+
+    // ── Build summary details for admin notes ──
+    $result['details'][] = sprintf("%d daily items across %s to %s",
+        $result['items_created'],
+        reset($dailyBuckets) !== false ? array_key_first($dailyBuckets) : '?',
+        end($dailyBuckets) !== false ? array_key_last($dailyBuckets) : '?'
+    );
+    if ($totalCpuHours > 0) {
+        $result['details'][] = sprintf("CPU: %.2f core-hours @ \$%.4f = \$%.2f", $totalCpuHours, $rates['cpu_per_hour'], round($totalCpuHours * $rates['cpu_per_hour'], 2));
+    }
+    if ($totalMemGBHours > 0) {
+        $result['details'][] = sprintf("RAM: %.2f GB-hours @ \$%.4f = \$%.2f", $totalMemGBHours, $rates['memory_per_gb_hour'], round($totalMemGBHours * $rates['memory_per_gb_hour'], 2));
+    }
+    foreach ($totalStorageGBHours as $p => $gbh) {
+        $result['details'][] = sprintf("Storage (%s): %.2f GB-hours @ \$%.4f = \$%.2f", $p, $gbh, $rates['storage_per_gb_hour'], round($gbh * $rates['storage_per_gb_hour'], 2));
+    }
+    foreach ($totalBackupGBHours as $t => $gbh) {
+        $result['details'][] = sprintf("Backup (%s): %.2f GB-hours @ \$%.4f = \$%.2f", $t, $gbh, $rates['backup_storage_per_gb_hour'], round($gbh * $rates['backup_storage_per_gb_hour'], 2));
+    }
+    foreach ($totalIsoGBHours as $t => $gbh) {
+        $result['details'][] = sprintf("ISO (%s): %.2f GB-hours @ \$%.4f = \$%.2f", $t, $gbh, $rates['iso_storage_per_gb_hour'], round($gbh * $rates['iso_storage_per_gb_hour'], 2));
+    }
+
+    return $result;
+}
+
+/**
+ * Delete all uninvoiced PAYG billable items for a specific VDC.
+ *
+ * Identifies items by VDC UUID in the description text. Returns the count
+ * of deleted items and the latest invoiced item's duedate (for sync reset).
+ *
+ * @param int    $userId  WHMCS client ID
+ * @param string $vdcId   VDC UUID
+ * @return array ['deleted' => int, 'last_invoiced_date' => string|null]
+ */
+function multiportal_deleteUninvoicedPAYGItems($userId, $vdcId)
+{
+    // Find latest invoiced item date for this VDC (for sync date reset)
+    // tblbillableitems uses invoicecount (not invoiceid) to track invoicing
+    $lastInvoicedDate = Capsule::table('tblbillableitems')
+        ->where('userid', $userId)
+        ->where('invoicecount', '>', 0)
+        ->where('description', 'LIKE', '%(' . $vdcId . ')%')
+        ->orderBy('duedate', 'desc')
+        ->value('duedate');
+
+    // Delete uninvoiced items (invoicecount = 0 means not yet collected)
+    $deleted = Capsule::table('tblbillableitems')
+        ->where('userid', $userId)
+        ->where('invoicecount', 0)
+        ->where('description', 'LIKE', '%(' . $vdcId . ')%')
+        ->delete();
+
+    return [
+        'deleted'            => $deleted,
+        'last_invoiced_date' => $lastInvoicedDate,
+    ];
+}
+
+/**
+ * Provision a new VDC: create tenant, user, VDC, and attach storage policies.
+ */
 function multiportal_CreateAccount(array $params)
 {
     try {
         // Check if VDC already exists
         $existingVdcId = isset($params['customfields']['VDC UUID']) ? $params['customfields']['VDC UUID'] : getProductCustomFieldValue($params['serviceid'], 'VDC UUID');
         if (!empty($existingVdcId)) {
-            multiportal_log('CreateAccount', ['vdc_id' => $existingVdcId], 'VDC already exists, skipping creation');
-            return 'success'; // VDC already exists, nothing to do
+            multiportal_log('CreateAccount', ['vdc_id' => $existingVdcId], 'VDC already exists, aborting');
+            return 'VDC UUID is already set (' . $existingVdcId . ') — VDC already exists.';
         }
         
         // Validate configuration
@@ -1736,6 +2391,16 @@ function multiportal_CreateAccount(array $params)
         $res = $vdcMgr->getStoragePoliciesByDataCenter($dataCenterId);
         $storagePolicyConfig = verifyStoragePolicyOptions($params['configoptions'], $res);
 
+        // Determine allocation type early — needed for storage fallback below
+        $allocationType = multiportal_getAllocationType($params);
+
+        // PAYG storage options are hidden (hidden=1) and WHMCS does not pass
+        // hidden configurable options through $params['configoptions'] during
+        // provisioning. Fall back to reading the config group from the DB.
+        if (empty($storagePolicyConfig) && $allocationType === 2) {
+            $storagePolicyConfig = getPaygStoragePoliciesFromDb($params['pid'], $res);
+        }
+
         // 1. Check Reseller
         $reseller = $resellerMgr->findResellerByID($resellerId);
         //throw error if reseller not found
@@ -1744,7 +2409,27 @@ function multiportal_CreateAccount(array $params)
         }
 
         // 2. Create/check Tenant
-        $tenantUUID = getClientCustomFieldValue($params, 'MultiPortal Tenant UUID');
+        // Ensure per-product Tenant UUID and URL fields exist so they show in admin UI
+        ensureProductCustomFields($params['pid']);
+        // Check service-level first, then same-server reuse, then client-level fallback
+        $tenantUUID = multiportal_getCredential($params, 'Tenant UUID', 'MultiPortal Tenant UUID');
+
+        // Remember if THIS service already had its own Tenant UUID before this run.
+        // Used later to decide whether $params['username'] is a real MultiPortal user
+        // or just a WHMCS auto-generated placeholder. Only checks service-level custom
+        // fields — client-level fallback doesn't count (means un-migrated, not provisioned).
+        $serviceAlreadyProvisioned = !empty($params['customfields']['Tenant UUID'] ?? '')
+            || !empty(getProductCustomFieldValue($params['serviceid'], 'Tenant UUID'));
+
+        // If no tenant found yet, check if another service on the same server has one
+        if (empty($tenantUUID)) {
+            $existingCreds = multiportal_findExistingCredentials(
+                $params['userid'], $params['serverid'], $params['serviceid']
+            );
+            if ($existingCreds && !empty($existingCreds['tenant_uuid'])) {
+                $tenantUUID = $existingCreds['tenant_uuid'];
+            }
+        }
 
         if (empty($tenantUUID)) {
             if (!empty($params['clientsdetails']['companyname']))
@@ -1759,112 +2444,161 @@ function multiportal_CreateAccount(array $params)
                 $params['clientsdetails']['firstname'] . ' ' . $params['clientsdetails']['lastname'],
                 $params['clientsdetails']['phonenumber']
             );
-            setClientCustomFieldValue($params['userid'], 'MultiPortal Tenant UUID', $tenant['uuid']);
+            // Store tenant UUID in service-level custom field
+            setCustomFieldValue($params['serviceid'], 'Tenant UUID', $tenant['uuid']);
         } else {
             $tenant = $tenantMgr->findTenantByID($tenantUUID);
+            // Ensure this service has the tenant UUID in its own custom field
+            setCustomFieldValue($params['serviceid'], 'Tenant UUID', $tenantUUID);
         }
 
         if (!$tenant) {
             throw new Exception('Failed to create or find tenant.');
         }
-        
-        // 2.5. Create user for the tenant if it doesn't exist (ONE USER PER CLIENT)
-        $multiportalUsername = '';
-        $multiportalPassword = '';
-        $multiportalUrl = '';
-        
-        // Check if client already has MultiPortal credentials
-        $existingUsername = getClientCustomFieldValue($params, 'MultiPortal Username');
-        $existingPassword = getClientCustomFieldValue($params, 'MultiPortal Password');
-        $existingUrl = getClientCustomFieldValue($params, 'MultiPortal URL');
-        
-        if (empty($existingUsername) || empty($existingPassword)) {
-            // Generate username from email (client-based, not service-based)
+
+        // 2.5. Create user for the tenant if it doesn't exist
+        // One user per client per MultiPortal server — reuse across services on same server
+        // Credentials stored in tblhosting.username/tblhosting.password (WHMCS native fields)
+
+        // WHMCS auto-generates a placeholder username from the domain when an order
+        // is submitted (e.g. "allocpr"), before CreateAccount runs. We must NOT treat
+        // this as a real MultiPortal user. Only trust $params['username'] if the
+        // service already had a Tenant UUID (meaning it was previously provisioned).
+        $existingUsername = ($serviceAlreadyProvisioned && !empty($params['username']))
+            ? $params['username'] : '';
+
+        // If not, check same-server sibling services
+        if (empty($existingUsername)) {
+            if (!isset($existingCreds)) {
+                $existingCreds = multiportal_findExistingCredentials(
+                    $params['userid'], $params['serverid'], $params['serviceid']
+                );
+            }
+            if ($existingCreds && !empty($existingCreds['username'])) {
+                $existingUsername = $existingCreds['username'];
+            }
+        }
+
+        // Also check client-level custom field as backwards-compat fallback
+        if (empty($existingUsername)) {
+            $existingUsername = getClientCustomFieldValue($params, 'MultiPortal Username');
+        }
+
+        if (empty($existingUsername)) {
+            // No existing credentials — create new user in MultiPortal
             $emailParts = explode('@', $params['clientsdetails']['email']);
             $baseUsername = $emailParts[0];
-            $multiportalUsername = $baseUsername . '_' . $params['userid']; // Use client ID instead of service ID
-            
-            // Generate secure password
+            $multiportalUsername = $baseUsername . '_' . $params['userid'];
             $multiportalPassword = generateSecurePassword(16);
-            
+
             try {
                 multiportal_log('CreateAccount', [
                     'tenant_uuid' => $tenant['uuid'],
                     'username' => $multiportalUsername,
                     'email' => $params['clientsdetails']['email'],
                     'client_id' => $params['userid']
-                ], 'Attempting to create user (client-based)');
-                
-                // Create user in MultiPortal
-                $user = $tenantMgr->createUser(
-                    $tenant['uuid'],
-                    $multiportalUsername,
-                    $multiportalPassword,
-                    $params['clientsdetails']['email'],
-                    $params['clientsdetails']['firstname'],
-                    $params['clientsdetails']['lastname'],
-                    'Tenant Administrator'
-                );
-                
-                multiportal_log('CreateAccount', ['user_response' => $user], 'User creation API response');
-                
-                // Get tenant URL - check if tenant has a domain field, otherwise construct it
-                if (isset($tenant['domain']) && !empty($tenant['domain'])) {
-                    $multiportalUrl = 'https://' . $tenant['domain'];
-                } else {
-                    // Fallback: construct from tenant name
-                    //$tenantName = strtolower(preg_replace('/[^a-zA-Z0-9]/', '', $tenant['name']));
-                    $multiportalUrl = 'https://' . $params['serverhostname'] . '/';
+                ], 'Attempting to create user');
+
+                try {
+                    $user = $tenantMgr->createUser(
+                        $tenant['uuid'],
+                        $multiportalUsername,
+                        $multiportalPassword,
+                        $params['clientsdetails']['email'],
+                        $params['clientsdetails']['firstname'],
+                        $params['clientsdetails']['lastname'],
+                        'Tenant Administrator'
+                    );
+                    multiportal_log('CreateAccount', ['user_response' => $user], 'User creation API response');
+                } catch (Exception $createEx) {
+                    $errorMsg = $createEx->getMessage();
+                    if (strpos($errorMsg, 'already been taken') !== false || strpos($errorMsg, '422') !== false) {
+                        // User already exists — find them and reset password
+                        $existingUser = $tenantMgr->findUserInTenant(
+                            $tenant['uuid'], $multiportalUsername, $params['clientsdetails']['email']
+                        );
+                        if ($existingUser && !empty($existingUser['id'])) {
+                            $multiportalUsername = $existingUser['username'];
+                            $tenantMgr->updateUser($tenant['uuid'], $existingUser['id'], [
+                                'password' => $multiportalPassword,
+                                'confirmPassword' => $multiportalPassword,
+                            ]);
+                            multiportal_log('CreateAccount', [
+                                'user_id' => $existingUser['id'],
+                                'username' => $multiportalUsername,
+                            ], 'Existing user found — password reset');
+                        } else {
+                            throw new Exception('User already exists but could not be found for password reset.');
+                        }
+                    } else {
+                        throw $createEx;
+                    }
                 }
-                
-                // Store credentials in CLIENT custom fields (not service fields)
-                setClientCustomFieldValue($params['userid'], 'MultiPortal Username', $multiportalUsername);
-                setClientCustomFieldValue($params['userid'], 'MultiPortal Password', $multiportalPassword);
-                setClientCustomFieldValue($params['userid'], 'MultiPortal URL', $multiportalUrl);
-                
+
+                // Store credentials in tblhosting (WHMCS passes these as $params['username']/$params['password'])
+                Capsule::table('tblhosting')
+                    ->where('id', $params['serviceid'])
+                    ->update([
+                        'username' => $multiportalUsername,
+                        'password' => encrypt($multiportalPassword)
+                    ]);
+
                 multiportal_log('CreateAccount', [
                     'username' => $multiportalUsername,
-                    'url' => $multiportalUrl,
-                    'client_id' => $params['userid']
-                ], 'Client credentials stored successfully');
+                    'service_id' => $params['serviceid']
+                ], 'Credentials stored in tblhosting');
             } catch (Exception $e) {
                 multiportal_log('CreateAccount', [
                     'error' => $e->getMessage(),
                     'trace' => $e->getTraceAsString(),
                     'client_id' => $params['userid']
                 ], 'Failed to create user - will retry later');
-                
-                // Continue with VDC creation even if user creation fails
             }
         } else {
-            // User already exists for this client
-            $multiportalUsername = $existingUsername;
-            $multiportalPassword = $existingPassword;
-            $multiportalUrl = $existingUrl;
-            
+            // Reuse existing credentials from same server — copy to this service's tblhosting
+            if ($existingCreds && !empty($existingCreds['password_encrypted'])) {
+                // Copy encrypted password directly from sibling service
+                Capsule::table('tblhosting')
+                    ->where('id', $params['serviceid'])
+                    ->update([
+                        'username' => $existingCreds['username'],
+                        'password' => $existingCreds['password_encrypted']
+                    ]);
+            }
+
             multiportal_log('CreateAccount', [
-                'username' => $multiportalUsername,
-                'client_id' => $params['userid']
-            ], 'Using existing client credentials');
-        }
-        
-        // 3. Create VDC
-        // Determine allocation type from configurable option
-        $allocationType = 1; // Default to Allocation
-        if (isset($params['configoptions']['Allocation Type'])) {
-            $selectedType = $params['configoptions']['Allocation Type'];
-            // Convert the selection to allocation type ID
-            if (stripos($selectedType, 'pay as you go') !== false || stripos($selectedType, 'payg') !== false) {
-                $allocationType = 2;
+                'username' => $existingUsername,
+                'service_id' => $params['serviceid']
+            ], 'Reusing existing credentials from same server');
+
+            // Copy URL from sibling service if available
+            if ($existingCreds && !empty($existingCreds['url'])) {
+                setCustomFieldValue($params['serviceid'], 'URL', $existingCreds['url']);
             }
         }
 
+        // Store portal URL in service-level custom field (derive from API URL)
+        $apiUrl = ModuleConfiguration::get($params, ModuleConfiguration::FIELD_API_URL);
+        if (!empty($apiUrl)) {
+            $portalUrl = rtrim($apiUrl, '/');
+            $portalUrl = preg_replace('#/api(/v\d+)?$#', '', $portalUrl);
+            setCustomFieldValue($params['serviceid'], 'URL', $portalUrl);
+        }
+
+        // 3. Create VDC
+        // For PAYG, CPU/Memory are not selected by the client.
+        // API requires minimum 1 for both, so default to 1.
+        $cpu = isset($params['configoptions']['CPU'])
+            ? max(1, (int) $params['configoptions']['CPU']) : 1;
+        $memory = isset($params['configoptions']['Memory Allocation'])
+            ? max(1, (int) $params['configoptions']['Memory Allocation']) : 1;
+
         $vdc = $vdcMgr->createVDC(
             'VDC - ' . $params['serviceid'],
-            $dataCenterId, // Use the variable we already got from ModuleConfiguration
+            $dataCenterId,
             $tenant['uuid'],
-            (int) $params['configoptions']['CPU'], // CPU
-            (int) $params['configoptions']['Memory Allocation'],  // RAM
+            $cpu,
+            $memory,
             true,
             $allocationType,
         );
@@ -1882,8 +2616,20 @@ function multiportal_CreateAccount(array $params)
             ]);
         }
 
+        // Seed Last Usage Sync so the billing cron has a proper starting point
+        if ($allocationType === 2) {
+            setCustomFieldValue($params['serviceid'], 'Last Usage Sync', date('Y-m-d H:i:s'));
+        }
+
+        $allocLabel = $allocationType === 2 ? 'PAYG' : 'Allocation';
+        multiportal_appendAdminNote($params['serviceid'],
+            "CreateAccount: VDC created ({$vdc['uuid']}). Tenant: {$tenant['name']} ({$tenant['uuid']}). "
+            . "Type: {$allocLabel}. CPU: {$cpu}, RAM: {$memory}GB. Storage policies: " . count($storagePolicyConfig));
+
         return 'success';
     } catch (Exception $e) {
+        multiportal_appendAdminNote($params['serviceid'],
+            "CreateAccount ERROR: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
 }
@@ -1900,15 +2646,77 @@ function verifyStoragePolicyOptions($configOptions, $res)
     $storageConfig = [];
     foreach ($res['data'] as $storagePolicy) {
         $configOptionsFormat = "Storage - {$storagePolicy['name']}";
-        $storageQty = (int) $configOptions[$configOptionsFormat] ?? 0;
-        if (isset($configOptions[$configOptionsFormat])) {
+        if (!isset($configOptions[$configOptionsFormat])) {
+            continue;
+        }
+        $storageQty = (int) $configOptions[$configOptionsFormat];
+        if ($storageQty < 1) {
+            continue; // Skip policies with 0 capacity — not selected
+        }
+        $storageConfig[] = [
+            'name' => $storagePolicy['name'],
+            'storage_policy_id' => $storagePolicy['uuid'],
+            'capacity' => $storageQty,
+        ];
+    }
+    return $storageConfig;
+}
+
+/**
+ * Get PAYG storage policies from the database.
+ *
+ * Hidden configurable options (hidden=1) are not passed through in
+ * $params['configoptions'] by WHMCS during provisioning. For PAYG products
+ * whose storage options are hidden, this function reads the linked config
+ * group directly from the DB and returns policies where qtyminimum >= 1
+ * (i.e. admin has opted-in that policy for auto-provisioning).
+ *
+ * @param int   $productId         WHMCS product ID ($params['pid'])
+ * @param array $dcStoragePolicies API response from getStoragePoliciesByDataCenter()
+ * @return array Same format as verifyStoragePolicyOptions()
+ */
+function getPaygStoragePoliciesFromDb($productId, $dcStoragePolicies)
+{
+    $storageConfig = [];
+
+    // Find the linked MultiPortal config group for this product
+    $groupId = Capsule::table('tblproductconfiglinks')
+        ->join('tblproductconfiggroups', 'tblproductconfiglinks.gid', '=', 'tblproductconfiggroups.id')
+        ->where('tblproductconfiglinks.pid', $productId)
+        ->where('tblproductconfiggroups.name', 'LIKE', '%MultiPortal%')
+        ->value('tblproductconfiglinks.gid');
+
+    if (!$groupId) {
+        return $storageConfig;
+    }
+
+    // Get storage options from this group where admin set qtyminimum >= 1
+    $storageOptions = Capsule::table('tblproductconfigoptions')
+        ->where('gid', (int) $groupId)
+        ->where('optionname', 'LIKE', 'Storage - %')
+        ->where('qtyminimum', '>=', 1)
+        ->get();
+
+    // Build a lookup from policy name to API UUID
+    $policyLookup = [];
+    if (isset($dcStoragePolicies['data']) && is_array($dcStoragePolicies['data'])) {
+        foreach ($dcStoragePolicies['data'] as $policy) {
+            $policyLookup[$policy['name']] = $policy['uuid'];
+        }
+    }
+
+    foreach ($storageOptions as $option) {
+        // Extract policy name from "Storage - {name}"
+        $policyName = substr($option->optionname, strlen('Storage - '));
+        if (isset($policyLookup[$policyName])) {
             $storageConfig[] = [
-                'name' => $storagePolicy['name'],
-                'storage_policy_id' => $storagePolicy['uuid'],
-                'capacity' => $storageQty,
+                'name' => $policyName,
+                'storage_policy_id' => $policyLookup[$policyName],
+                'capacity' => max(1, (int) $option->qtyminimum),
             ];
         }
     }
+
     return $storageConfig;
 }
 
@@ -2209,9 +3017,14 @@ function multiportal_DisableVdc(array $params)
             ->where('id', $params['serviceid'])
             ->update(['domainstatus' => 'Suspended']);
 
+        multiportal_appendAdminNote($params['serviceid'],
+            "Suspend VDC: VDC {$vdcId} suspended. WHMCS status set to Suspended.");
+
         return 'success';
     } catch (Exception $e) {
         multiportal_log('DisableVdc', $params, ['error' => $e->getMessage()]);
+        multiportal_appendAdminNote($params['serviceid'],
+            "Suspend VDC ERROR: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
 }
@@ -2248,12 +3061,21 @@ function multiportal_EnableVdc(array $params)
             ->where('id', $params['serviceid'])
             ->update(['domainstatus' => 'Active']);
 
+        multiportal_appendAdminNote($params['serviceid'],
+            "Unsuspend VDC: VDC {$vdcId} unsuspended. WHMCS status set to Active.");
+
         return 'success';
     } catch (Exception $e) {
         multiportal_log('EnableVdc', $params, ['error' => $e->getMessage()]);
+        multiportal_appendAdminNote($params['serviceid'],
+            "Unsuspend VDC ERROR: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
 }
+
+/**
+ * Permanently delete a VDC after admin confirmation.
+ */
 function multiportal_DestroyVdc(array $params)
 {
     try {
@@ -2337,10 +3159,16 @@ function multiportal_DestroyVdc(array $params)
         multiportal_log('DestroyVdc', ['vdcId' => $vdcId], 'VDC deleted successfully');
 
         setCustomFieldValue($params['serviceid'], 'VDC UUID', '');
+
+        multiportal_appendAdminNote($params['serviceid'],
+            "DELETE VDC: VDC {$vdcId} permanently deleted. VDC UUID cleared.");
+
         return 'success';
     } catch (Exception $e) {
         // Clear confirmation on error
         unset($_SESSION['confirm_delete_vdc_' . $params['serviceid']]);
+        multiportal_appendAdminNote($params['serviceid'],
+            "DELETE VDC ERROR: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
 }
@@ -2368,9 +3196,8 @@ function multiportal_cleanupConfirmations()
 function multiportal_SetupWizard(array $params)
 {
     try {
-        // First, validate API credentials and test connection
+        // Validate API credentials and test connection
         try {
-            // Debug: Log what params we're receiving
             multiportal_log('SetupWizard', [
                 'params_keys' => array_keys($params),
                 'has_serverusername' => isset($params['serverusername']),
@@ -2379,32 +3206,25 @@ function multiportal_SetupWizard(array $params)
                 'server_id' => $params['serverid'] ?? 'NO SERVER ID',
                 'product_id' => $params['pid'] ?? 'NO PRODUCT ID'
             ], 'Debug: Checking params structure');
-            
-            // Check if credentials are configured
+
             $clientId = ModuleConfiguration::getClientId($params);
             $clientSecret = ModuleConfiguration::getClientSecret($params);
-            
-            // Test API connection
+
             $api = initiateAPI($params);
-            
-            // Skip the reseller test - we'll validate with the data center check below
+
             multiportal_log('SetupWizard', ['action' => 'API initialized'], 'API client created');
-            
+
         } catch (Exception $e) {
-            $serverId = $params['serverid'] ?? 'unknown';
-            
-            // Simple error message
             if (strpos($e->getMessage(), 'Client ID') !== false || strpos($e->getMessage(), 'Client Secret') !== false) {
                 return 'Error: Server credentials are empty. Go to System Settings > Servers and edit the Multiportal Server to add your API credentials.';
             }
-            
             return 'Error: ' . $e->getMessage();
         }
-        
-        // Now ensure custom fields exist
-        $customFieldsCreated = [];
+
+        // Ensure custom fields exist
         try {
-            $customFieldsCreated = ensureCustomFieldsExist();
+            ensureCustomFieldsExist();
+            ensureProductCustomFields($params['pid']);
         } catch (Exception $e) {
             return 'Error creating custom fields: ' . $e->getMessage();
         }
@@ -2416,18 +3236,19 @@ function multiportal_SetupWizard(array $params)
             throw new Exception('Data Center UUID must be configured in the product module settings first.');
         }
 
-        // Validate that the Data Center UUID exists
+        // Validate Data Center UUID
         try {
             $dataCenterResponse = $api->get('/data-center/' . $dataCenterId);
             if (!$dataCenterResponse || !isset($dataCenterResponse['data'])) {
                 throw new Exception('Data Center UUID is invalid or not found.');
             }
-            multiportal_log('SetupWizard', ['datacenter' => $dataCenterResponse['data']['name'] ?? 'Unknown'], 'Data Center validated');
+            $dataCenterName = $dataCenterResponse['data']['name'] ?? 'Unknown';
+            multiportal_log('SetupWizard', ['datacenter' => $dataCenterName], 'Data Center validated');
         } catch (Exception $e) {
             return 'Data Center Validation Error: ' . $e->getMessage() . ' Please check the Data Center UUID in module settings.';
         }
 
-        // Create product-specific custom fields
+        // Create product-specific VDC UUID custom field
         $vdcField = Capsule::table('tblcustomfields')
             ->where('type', 'product')
             ->where('relid', $productId)
@@ -2437,7 +3258,7 @@ function multiportal_SetupWizard(array $params)
         if (!$vdcField) {
             Capsule::table('tblcustomfields')->insert([
                 'type' => 'product',
-                'relid' => $productId,  // THIS IS THE KEY - specific to this product!
+                'relid' => $productId,
                 'fieldname' => 'VDC UUID',
                 'fieldtype' => 'text',
                 'description' => 'Stores the Virtual Data Center identifier',
@@ -2449,48 +3270,52 @@ function multiportal_SetupWizard(array $params)
                 'showinvoice' => '',
                 'sortorder' => 0
             ]);
-            $customFieldsCreated[] = 'Product field: Virtual Data Center UUID (for product ' . $productId . ')';
         }
 
-        // Check if a configurable option group already exists for this product
-        $existingGroup = Capsule::table('tblproductconfiglinks')
+        // Determine this product's allocation type from configoption7
+        $allocationType = multiportal_getAllocationType($params);
+        $isPayg = ($allocationType === 2);
+
+        multiportal_log('SetupWizard', [
+            'allocation_type' => $allocationType,
+            'is_payg' => $isPayg,
+            'configoption7' => $params['configoption7'] ?? 'NOT SET'
+        ], 'Allocation type determined');
+
+        // Check if this product already has a MultiPortal config group linked
+        $existingLink = Capsule::table('tblproductconfiglinks')
             ->join('tblproductconfiggroups', 'tblproductconfiglinks.gid', '=', 'tblproductconfiggroups.id')
             ->where('tblproductconfiglinks.pid', $productId)
             ->where('tblproductconfiggroups.name', 'LIKE', '%MultiPortal%')
             ->first();
 
-        if ($existingGroup) {
-            return 'Configurable options already exist for this product. Group: ' . $existingGroup->name;
+        if ($existingLink) {
+            // If the linked group has options, it's fully set up — nothing to do
+            $linkedOptionCount = Capsule::table('tblproductconfigoptions')
+                ->where('gid', $existingLink->gid)
+                ->count();
+            if ($linkedOptionCount > 0) {
+                return 'Configurable options already exist for this product. Group: ' . $existingLink->name;
+            }
+            // Otherwise the group is empty (e.g. PAYG group missing marker option) —
+            // remove the link so the wizard can re-run and backfill properly
+            Capsule::table('tblproductconfiglinks')
+                ->where('pid', $productId)
+                ->where('gid', $existingLink->gid)
+                ->delete();
+            multiportal_log('SetupWizard', [
+                'product_id' => $productId,
+                'empty_group' => $existingLink->name
+            ], 'Removed link to empty config group, re-running wizard');
         }
 
-        // Create a new configurable option group
-        $groupName = 'MultiPortal Options - Product ' . $productId;
-        Capsule::table('tblproductconfiggroups')->insert([
-            'name' => $groupName,
-            'description' => 'Auto-generated MultiPortal configurable options'
-        ]);
-        $groupId = Capsule::getPdo()->lastInsertId();
-
-        // Link the group to this product
-        Capsule::table('tblproductconfiglinks')->insert([
-            'gid' => $groupId,
-            'pid' => $productId
-        ]);
-
+        // --- Pricing helper ---
         $currencies = Capsule::table('tblcurrencies')->select('id')->get();
         $pricingTemplate = [
-            'msetupfee' => '0.00',
-            'qsetupfee' => '0.00',
-            'ssetupfee' => '0.00',
-            'asetupfee' => '0.00',
-            'bsetupfee' => '0.00',
-            'tsetupfee' => '0.00',
-            'monthly' => '0.00',
-            'quarterly' => '0.00',
-            'semiannually' => '0.00',
-            'annually' => '0.00',
-            'biennially' => '0.00',
-            'triennially' => '0.00'
+            'msetupfee' => '0.00', 'qsetupfee' => '0.00', 'ssetupfee' => '0.00',
+            'asetupfee' => '0.00', 'bsetupfee' => '0.00', 'tsetupfee' => '0.00',
+            'monthly' => '0.00', 'quarterly' => '0.00', 'semiannually' => '0.00',
+            'annually' => '0.00', 'biennially' => '0.00', 'triennially' => '0.00'
         ];
         $ensurePricing = function (int $relId) use ($currencies, $pricingTemplate) {
             foreach ($currencies as $currency) {
@@ -2499,7 +3324,6 @@ function multiportal_SetupWizard(array $params)
                     ->where('currency', $currency->id)
                     ->where('relid', $relId)
                     ->first();
-
                 if (!$existing) {
                     Capsule::table('tblpricing')->insert(array_merge([
                         'type' => 'configoptions',
@@ -2510,62 +3334,71 @@ function multiportal_SetupWizard(array $params)
             }
         };
 
-        // Create CPU option
-        Capsule::table('tblproductconfigoptions')->insert([
-            'gid' => $groupId,
-            'optionname' => 'CPU',
-            'optiontype' => 4, // Quantity
-            'qtyminimum' => 1,
-            'qtymaximum' => 128,
-            'order' => 1,
-            'hidden' => 0
-        ]);
-        $cpuOptionId = Capsule::getPdo()->lastInsertId();
-
-        // Create sub-option for CPU
-        Capsule::table('tblproductconfigoptionssub')->insert([
-            'configid' => $cpuOptionId,
-            'optionname' => 'CPU Core',
-            'sortorder' => 0,
-            'hidden' => 0
-        ]);
-        $cpuSubOptionId = (int) Capsule::getPdo()->lastInsertId();
-        $ensurePricing($cpuSubOptionId);
-
-        // Create Memory option
-        Capsule::table('tblproductconfigoptions')->insert([
-            'gid' => $groupId,
-            'optionname' => 'Memory Allocation',
-            'optiontype' => 4, // Quantity
-            'qtyminimum' => 1,
-            'qtymaximum' => 512,
-            'order' => 2,
-            'hidden' => 0
-        ]);
-        $memoryOptionId = Capsule::getPdo()->lastInsertId();
-
-        // Create sub-option for Memory
-        Capsule::table('tblproductconfigoptionssub')->insert([
-            'configid' => $memoryOptionId,
-            'optionname' => 'GB',
-            'sortorder' => 0,
-            'hidden' => 0
-        ]);
-        $memorySubOptionId = (int) Capsule::getPdo()->lastInsertId();
-        $ensurePricing($memorySubOptionId);
-
-        // Fetch storage policies from the data center
-        $api = initiateAPI($params);
+        // Fetch storage policies from the data center (needed for both groups)
         $vdcMgr = new VDCManager($api);
         $storagePolicies = $vdcMgr->getStoragePoliciesByDataCenter($dataCenterId);
+        $storagePolicyData = (isset($storagePolicies['data']) && is_array($storagePolicies['data']))
+            ? $storagePolicies['data'] : [];
 
-        if (isset($storagePolicies['data']) && is_array($storagePolicies['data'])) {
+        // =====================================================================
+        // GROUP 1: MultiPortal Allocation Options (per data center)
+        // =====================================================================
+        $allocationGroupName = 'MultiPortal Allocation Options - ' . $dataCenterName;
+        $allocationGroup = Capsule::table('tblproductconfiggroups')
+            ->where('name', $allocationGroupName)
+            ->first();
+
+        if (!$allocationGroup) {
+            Capsule::table('tblproductconfiggroups')->insert([
+                'name' => $allocationGroupName,
+                'description' => 'Auto-generated MultiPortal options for Allocation type products (CPU, Memory, Storage)'
+            ]);
+            $allocationGroupId = (int) Capsule::getPdo()->lastInsertId();
+
+            // CPU option
+            Capsule::table('tblproductconfigoptions')->insert([
+                'gid' => $allocationGroupId,
+                'optionname' => 'CPU',
+                'optiontype' => 4, // Quantity
+                'qtyminimum' => 1,
+                'qtymaximum' => 128,
+                'order' => 1,
+                'hidden' => 0
+            ]);
+            $cpuOptionId = Capsule::getPdo()->lastInsertId();
+            Capsule::table('tblproductconfigoptionssub')->insert([
+                'configid' => $cpuOptionId,
+                'optionname' => 'CPU Core',
+                'sortorder' => 0,
+                'hidden' => 0
+            ]);
+            $ensurePricing((int) Capsule::getPdo()->lastInsertId());
+
+            // Memory option
+            Capsule::table('tblproductconfigoptions')->insert([
+                'gid' => $allocationGroupId,
+                'optionname' => 'Memory Allocation',
+                'optiontype' => 4, // Quantity
+                'qtyminimum' => 1,
+                'qtymaximum' => 512,
+                'order' => 2,
+                'hidden' => 0
+            ]);
+            $memoryOptionId = Capsule::getPdo()->lastInsertId();
+            Capsule::table('tblproductconfigoptionssub')->insert([
+                'configid' => $memoryOptionId,
+                'optionname' => 'GB',
+                'sortorder' => 0,
+                'hidden' => 0
+            ]);
+            $ensurePricing((int) Capsule::getPdo()->lastInsertId());
+
+            // Storage policy options
             $order = 3;
-            foreach ($storagePolicies['data'] as $policy) {
+            foreach ($storagePolicyData as $policy) {
                 if (!empty($policy['name'])) {
-                    // Create storage policy option
                     Capsule::table('tblproductconfigoptions')->insert([
-                        'gid' => $groupId,
+                        'gid' => $allocationGroupId,
                         'optionname' => 'Storage - ' . $policy['name'],
                         'optiontype' => 4, // Quantity
                         'qtyminimum' => 0,
@@ -2574,84 +3407,480 @@ function multiportal_SetupWizard(array $params)
                         'hidden' => 0
                     ]);
                     $storageOptionId = Capsule::getPdo()->lastInsertId();
-
-                    // Create sub-option for storage
                     Capsule::table('tblproductconfigoptionssub')->insert([
                         'configid' => $storageOptionId,
                         'optionname' => 'GB',
                         'sortorder' => 0,
                         'hidden' => 0
                     ]);
-                    $storageSubOptionId = (int) Capsule::getPdo()->lastInsertId();
-                    $ensurePricing($storageSubOptionId);
+                    $ensurePricing((int) Capsule::getPdo()->lastInsertId());
                 }
             }
+
+            multiportal_log('SetupWizard', ['group_id' => $allocationGroupId], 'Created Allocation Options group');
+        } else {
+            $allocationGroupId = (int) $allocationGroup->id;
+            multiportal_log('SetupWizard', ['group_id' => $allocationGroupId], 'Allocation Options group already exists');
         }
 
-        // Optional: Create Allocation Type dropdown
-        Capsule::table('tblproductconfigoptions')->insert([
-            'gid' => $groupId,
-            'optionname' => 'Allocation Type',
-            'optiontype' => 1, // Dropdown
-            'qtyminimum' => 0,
-            'qtymaximum' => 0,
-            'order' => 100,
-            'hidden' => 0
-        ]);
-        $allocationOptionId = Capsule::getPdo()->lastInsertId();
+        // =====================================================================
+        // GROUP 2: MultiPortal PAYG Options (per data center)
+        // =====================================================================
+        $paygGroupName = 'MultiPortal PAYG Options - ' . $dataCenterName;
+        $paygGroup = Capsule::table('tblproductconfiggroups')
+            ->where('name', $paygGroupName)
+            ->first();
 
-        multiportal_log('SetupWizard', ['allocation_option_id' => $allocationOptionId], 'Created Allocation Type option');
+        if (!$paygGroup) {
+            Capsule::table('tblproductconfiggroups')->insert([
+                'name' => $paygGroupName,
+                'description' => 'Auto-generated MultiPortal options for Pay As You Go products (Storage)'
+            ]);
+            $paygGroupId = (int) Capsule::getPdo()->lastInsertId();
 
-        // Create allocation type sub-options
-        $allocationTypes = ['Allocation', 'Pay As You Go'];
-        foreach ($allocationTypes as $index => $type) {
-            // Check if sub-option already exists
-            $exists = Capsule::table('tblproductconfigoptionssub')
-                ->where('configid', $allocationOptionId)
-                ->where('optionname', $type)
-                ->first();
+            // WHMCS requires at least one option in a config group for the product
+            // to be recognized as having configurable options set up. Add a hidden
+            // marker option that is invisible to clients on the order page.
+            Capsule::table('tblproductconfigoptions')->insert([
+                'gid' => $paygGroupId,
+                'optionname' => 'MP_INIT_FLAG',
+                'optiontype' => 2, // Radio
+                'qtyminimum' => 0,
+                'qtymaximum' => 0,
+                'order' => 1,
+                'hidden' => 1
+            ]);
+            $paygMarkerOptionId = Capsule::getPdo()->lastInsertId();
+            Capsule::table('tblproductconfigoptionssub')->insert([
+                'configid' => $paygMarkerOptionId,
+                'optionname' => 'Enabled',
+                'sortorder' => 0,
+                'hidden' => 0
+            ]);
+            $ensurePricing((int) Capsule::getPdo()->lastInsertId());
 
-            if (!$exists) {
-                Capsule::table('tblproductconfigoptionssub')->insert([
-                    'configid' => $allocationOptionId,
-                    'optionname' => $type,
-                    'sortorder' => $index,
-                    'hidden' => 0
-                ]);
-                $allocationSubId = (int) Capsule::getPdo()->lastInsertId();
-                multiportal_log('SetupWizard', ['sub_option' => $type, 'index' => $index], 'Created sub-option');
-            } else {
-                $allocationSubId = (int) $exists->id;
+            // Storage policy options — hidden from clients, admin-only.
+            // Default 0 (not provisioned). Admin sets qtyminimum=1 on
+            // specific policies to always attach them during provisioning.
+            $paygOrder = 2;
+            foreach ($storagePolicyData as $policy) {
+                if (!empty($policy['name'])) {
+                    Capsule::table('tblproductconfigoptions')->insert([
+                        'gid' => $paygGroupId,
+                        'optionname' => 'Storage - ' . $policy['name'],
+                        'optiontype' => 4, // Quantity
+                        'qtyminimum' => 0,
+                        'qtymaximum' => 10000,
+                        'order' => $paygOrder++,
+                        'hidden' => 1
+                    ]);
+                    $storageOptionId = Capsule::getPdo()->lastInsertId();
+                    Capsule::table('tblproductconfigoptionssub')->insert([
+                        'configid' => $storageOptionId,
+                        'optionname' => 'GB',
+                        'sortorder' => 0,
+                        'hidden' => 0
+                    ]);
+                    $ensurePricing((int) Capsule::getPdo()->lastInsertId());
+                }
             }
 
-            $ensurePricing($allocationSubId);
+            multiportal_log('SetupWizard', ['group_id' => $paygGroupId, 'storage_policies' => count($storagePolicyData)], 'Created PAYG Options group');
+        } else {
+            $paygGroupId = (int) $paygGroup->id;
+
+            // Backfill: if PAYG group exists but has no options, add the hidden marker
+            $paygOptionCount = Capsule::table('tblproductconfigoptions')
+                ->where('gid', $paygGroupId)
+                ->count();
+            if ($paygOptionCount === 0) {
+                Capsule::table('tblproductconfigoptions')->insert([
+                    'gid' => $paygGroupId,
+                    'optionname' => 'MP_INIT_FLAG',
+                    'optiontype' => 2, // Radio
+                    'qtyminimum' => 0,
+                    'qtymaximum' => 0,
+                    'order' => 1,
+                    'hidden' => 1
+                ]);
+                $paygMarkerOptionId = Capsule::getPdo()->lastInsertId();
+                Capsule::table('tblproductconfigoptionssub')->insert([
+                    'configid' => $paygMarkerOptionId,
+                    'optionname' => 'Enabled',
+                    'sortorder' => 0,
+                    'hidden' => 0
+                ]);
+                $ensurePricing((int) Capsule::getPdo()->lastInsertId());
+                multiportal_log('SetupWizard', ['group_id' => $paygGroupId], 'Backfilled MP_INIT_FLAG marker option');
+            }
+
+            // Backfill: add storage policies if missing from existing PAYG group
+            $hasStorageOptions = Capsule::table('tblproductconfigoptions')
+                ->where('gid', $paygGroupId)
+                ->where('optionname', 'like', 'Storage - %')
+                ->exists();
+            if (!$hasStorageOptions && !empty($storagePolicyData)) {
+                $paygOrder = Capsule::table('tblproductconfigoptions')
+                    ->where('gid', $paygGroupId)
+                    ->max('order') + 1;
+                foreach ($storagePolicyData as $policy) {
+                    if (!empty($policy['name'])) {
+                        Capsule::table('tblproductconfigoptions')->insert([
+                            'gid' => $paygGroupId,
+                            'optionname' => 'Storage - ' . $policy['name'],
+                            'optiontype' => 4, // Quantity
+                            'qtyminimum' => 0,
+                            'qtymaximum' => 10000,
+                            'order' => $paygOrder++,
+                            'hidden' => 1
+                        ]);
+                        $storageOptionId = Capsule::getPdo()->lastInsertId();
+                        Capsule::table('tblproductconfigoptionssub')->insert([
+                            'configid' => $storageOptionId,
+                            'optionname' => 'GB',
+                            'sortorder' => 0,
+                            'hidden' => 0
+                        ]);
+                        $ensurePricing((int) Capsule::getPdo()->lastInsertId());
+                    }
+                }
+                multiportal_log('SetupWizard', ['group_id' => $paygGroupId, 'storage_policies' => count($storagePolicyData)], 'Backfilled storage policy options');
+            }
+
+            multiportal_log('SetupWizard', ['group_id' => $paygGroupId], 'PAYG Options group already exists');
         }
 
-        // Verify the sub-options were created
-        $createdSubs = Capsule::table('tblproductconfigoptionssub')
-            ->where('configid', $allocationOptionId)
-            ->count();
-        multiportal_log('SetupWizard', ['allocation_subs_count' => $createdSubs], 'Verified Allocation Type sub-options');
+        // =====================================================================
+        // Link the correct group to THIS product based on configoption7
+        // =====================================================================
+        $linkedGroupId = $isPayg ? $paygGroupId : $allocationGroupId;
+        $linkedGroupName = $isPayg ? $paygGroupName : $allocationGroupName;
 
-        // Build success message - keep it simple for WHMCS
-        $message = 'Setup completed successfully! ';
-        $message .= 'Created configurable options group "' . $groupName . '" with ';
-        $message .= 'CPU (1-128), Memory (1-512 GB), ' . count($storagePolicies['data']) . ' storage policies, and Allocation Type. ';
-        $message .= 'IMPORTANT: Due to WHMCS bug, you must now: ';
-        $message .= '1) Go to Configurable Options, ';
-        $message .= '2) Edit "' . $groupName . '", ';
-        $message .= '3) Click any Storage option, ';
-        $message .= '4) Save without changes. ';
-        $message .= 'This fixes the Allocation Type dropdown.';
-        
-        // WHMCS is very limited in what it can display for module commands
-        // We can only return 'success' or 'Error: message'
-        // Any other format shows as an error
-        
-        // The best we can do is return a success message that fits on one line
+        Capsule::table('tblproductconfiglinks')->insert([
+            'gid' => $linkedGroupId,
+            'pid' => $productId
+        ]);
+
+        multiportal_log('SetupWizard', [
+            'product_id' => $productId,
+            'linked_group' => $linkedGroupName,
+            'linked_group_id' => $linkedGroupId,
+            'allocation_group_id' => $allocationGroupId,
+            'payg_group_id' => $paygGroupId,
+            'storage_policies' => count($storagePolicyData)
+        ], 'Setup Wizard completed');
+
         return 'success';
     } catch (Exception $e) {
         multiportal_log('SetupWizard', $params, ['error' => $e->getMessage()]);
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+/**
+ * Re-Setup Product Options — sync new storage policies from the data center.
+ *
+ * Adds any storage policies that exist in the data center but are missing
+ * from the product's linked configurable option group. Never removes
+ * existing options so admin customizations and client data are preserved.
+ *
+ * @param array $params WHMCS module parameters
+ * @return string 'success' or error message
+ */
+function multiportal_ReSetupProductOptions(array $params)
+{
+    try {
+        $productId = $params['pid'];
+        $dataCenterId = ModuleConfiguration::get($params, ModuleConfiguration::FIELD_DATA_CENTER_ID);
+
+        // Find the linked MultiPortal config group for this product
+        $link = Capsule::table('tblproductconfiglinks')
+            ->join('tblproductconfiggroups', 'tblproductconfiglinks.gid', '=', 'tblproductconfiggroups.id')
+            ->where('tblproductconfiglinks.pid', $productId)
+            ->where('tblproductconfiggroups.name', 'LIKE', '%MultiPortal%')
+            ->first();
+
+        if (!$link) {
+            return 'Error: No MultiPortal config group linked to this product. Run Setup Product Options first.';
+        }
+
+        $groupId = (int) $link->gid;
+        $groupName = $link->name;
+        $isPaygGroup = (stripos($groupName, 'PAYG') !== false);
+
+        // Fetch current storage policies from the data center
+        $api = initiateAPI($params);
+        $vdcMgr = new VDCManager($api);
+        $storagePolicies = $vdcMgr->getStoragePoliciesByDataCenter($dataCenterId);
+        $storagePolicyData = (isset($storagePolicies['data']) && is_array($storagePolicies['data']))
+            ? $storagePolicies['data'] : [];
+
+        if (empty($storagePolicyData)) {
+            return 'No storage policies found in the data center. Nothing to add.';
+        }
+
+        // Get existing storage option names in this group
+        $existingOptions = Capsule::table('tblproductconfigoptions')
+            ->where('gid', $groupId)
+            ->where('optionname', 'like', 'Storage - %')
+            ->pluck('optionname')
+            ->toArray();
+
+        // Pricing helper
+        $currencies = Capsule::table('tblcurrencies')->select('id')->get();
+        $pricingTemplate = [
+            'msetupfee' => '0.00', 'qsetupfee' => '0.00', 'ssetupfee' => '0.00',
+            'asetupfee' => '0.00', 'bsetupfee' => '0.00', 'tsetupfee' => '0.00',
+            'monthly' => '0.00', 'quarterly' => '0.00', 'semiannually' => '0.00',
+            'annually' => '0.00', 'biennially' => '0.00', 'triennially' => '0.00'
+        ];
+        $ensurePricing = function (int $relId) use ($currencies, $pricingTemplate) {
+            foreach ($currencies as $currency) {
+                $existing = Capsule::table('tblpricing')
+                    ->where('type', 'configoptions')
+                    ->where('currency', $currency->id)
+                    ->where('relid', $relId)
+                    ->first();
+                if (!$existing) {
+                    Capsule::table('tblpricing')->insert(array_merge([
+                        'type' => 'configoptions',
+                        'currency' => $currency->id,
+                        'relid' => $relId
+                    ], $pricingTemplate));
+                }
+            }
+        };
+
+        // Add missing storage policies
+        $nextOrder = Capsule::table('tblproductconfigoptions')
+            ->where('gid', $groupId)
+            ->max('order') + 1;
+        $added = 0;
+
+        foreach ($storagePolicyData as $policy) {
+            if (empty($policy['name'])) {
+                continue;
+            }
+            $optionName = 'Storage - ' . $policy['name'];
+            if (in_array($optionName, $existingOptions)) {
+                continue;
+            }
+
+            Capsule::table('tblproductconfigoptions')->insert([
+                'gid' => $groupId,
+                'optionname' => $optionName,
+                'optiontype' => 4, // Quantity
+                'qtyminimum' => 0,
+                'qtymaximum' => 10000,
+                'order' => $nextOrder++,
+                'hidden' => $isPaygGroup ? 1 : 0
+            ]);
+            $storageOptionId = Capsule::getPdo()->lastInsertId();
+            Capsule::table('tblproductconfigoptionssub')->insert([
+                'configid' => $storageOptionId,
+                'optionname' => 'GB',
+                'sortorder' => 0,
+                'hidden' => 0
+            ]);
+            $ensurePricing((int) Capsule::getPdo()->lastInsertId());
+            $added++;
+        }
+
+        multiportal_log('ReSetupProductOptions', [
+            'product_id' => $productId,
+            'group' => $groupName,
+            'existing_storage' => count($existingOptions),
+            'dc_policies' => count($storagePolicyData),
+            'added' => $added
+        ], 'Re-setup completed');
+
+        if ($added === 0) {
+            multiportal_appendAdminNote($params['serviceid'],
+                "Re-Sync Storage Policies: No new policies to add ({$groupName}). "
+                . "Existing: " . count($existingOptions) . ", DC total: " . count($storagePolicyData));
+            return 'success';
+        }
+
+        multiportal_appendAdminNote($params['serviceid'],
+            "Re-Sync Storage Policies: Added {$added} new storage policies to '{$groupName}'. "
+            . "Existing: " . count($existingOptions) . ", DC total: " . count($storagePolicyData));
+
+        return 'success';
+    } catch (Exception $e) {
+        multiportal_log('ReSetupProductOptions', $params, ['error' => $e->getMessage()]);
+        multiportal_appendAdminNote($params['serviceid'],
+            "Re-Sync Storage Policies ERROR: " . $e->getMessage());
+        return 'Error: ' . $e->getMessage();
+    }
+}
+
+/**
+ * Migrate credentials from client-level to service-level custom fields.
+ *
+ * For existing services that predate the per-service credential storage.
+ * Copies Tenant UUID, Username, Password, and URL from client-level fields
+ * into the service's product-level custom fields and tblhosting, then zeroes
+ * out the legacy client-level fields so they don't linger.
+ */
+function multiportal_MigrateCredentials(array $params)
+{
+    try {
+        // Ensure product-level fields exist for this product
+        ensureCustomFieldsExist();
+        $productId = Capsule::table('tblhosting')->where('id', $params['serviceid'])->value('packageid');
+        ensureProductCustomFields($productId);
+
+        $migrated = [];
+        $skipped = [];
+
+        // Migrate Tenant UUID from client-level to service-level custom field
+        $tenantUUID = getClientCustomFieldValue($params, 'MultiPortal Tenant UUID');
+        $existingTenantUUID = getProductCustomFieldValue($params['serviceid'], 'Tenant UUID');
+        if (!empty($tenantUUID)) {
+            if (empty($existingTenantUUID)) {
+                setCustomFieldValue($params['serviceid'], 'Tenant UUID', $tenantUUID);
+                $migrated[] = 'Tenant UUID';
+            } else {
+                $skipped[] = 'Tenant UUID (already has value)';
+            }
+        }
+
+        // Migrate Username/Password from client-level custom fields to tblhosting.
+        // The 'MultiPortal Password' client field has fieldtype=password, so WHMCS
+        // stores the value already encrypted in tblcustomfieldsvalues. We read the
+        // raw DB value and copy it directly into tblhosting.password (which also
+        // expects WHMCS-encrypted format) — no encrypt() call needed.
+        $username = getClientCustomFieldValue($params, 'MultiPortal Username');
+        $passwordField = Capsule::table('tblcustomfields')
+            ->where('type', 'client')
+            ->where('fieldname', 'MultiPortal Password')
+            ->first();
+        $password = null;
+        if ($passwordField) {
+            $password = Capsule::table('tblcustomfieldsvalues')
+                ->where('fieldid', $passwordField->id)
+                ->where('relid', $params['userid'])
+                ->value('value');
+        }
+        if (!empty($username) && !empty($password)) {
+            // Only migrate if tblhosting doesn't already have credentials
+            $hosting = Capsule::table('tblhosting')->where('id', $params['serviceid'])->first();
+            if (empty($hosting->username)) {
+                Capsule::table('tblhosting')
+                    ->where('id', $params['serviceid'])
+                    ->update([
+                        'username' => $username,
+                        'password' => $password
+                    ]);
+                $migrated[] = 'Username/Password (to service record)';
+            } else {
+                $skipped[] = 'Username/Password (already has value)';
+            }
+        }
+
+        // Migrate URL from client-level custom field to service-level
+        $existingURL = getProductCustomFieldValue($params['serviceid'], 'URL');
+        if (empty($existingURL)) {
+            $url = getClientCustomFieldValue($params, 'MultiPortal URL');
+            if (!empty($url)) {
+                setCustomFieldValue($params['serviceid'], 'URL', $url);
+                $migrated[] = 'URL';
+            } else {
+                // Derive URL from server API config if no client-level field exists
+                $apiUrl = ModuleConfiguration::get($params, ModuleConfiguration::FIELD_API_URL);
+                if (!empty($apiUrl)) {
+                    $portalUrl = rtrim($apiUrl, '/');
+                    $portalUrl = preg_replace('#/api(/v\d+)?$#', '', $portalUrl);
+                    setCustomFieldValue($params['serviceid'], 'URL', $portalUrl);
+                    $migrated[] = 'URL (derived from server config)';
+                }
+            }
+        } else {
+            $skipped[] = 'URL (already has value)';
+        }
+
+        // Migrate Last Usage Sync from old relid=0 field to per-product field
+        $oldSyncField = Capsule::table('tblcustomfields')
+            ->where('type', 'product')
+            ->where('fieldname', 'Last Usage Sync')
+            ->where('relid', 0)
+            ->first();
+        $newSyncField = Capsule::table('tblcustomfields')
+            ->where('type', 'product')
+            ->where('fieldname', 'Last Usage Sync')
+            ->where('relid', $productId)
+            ->first();
+        if ($oldSyncField && $newSyncField) {
+            $oldValue = Capsule::table('tblcustomfieldsvalues')
+                ->where('fieldid', $oldSyncField->id)
+                ->where('relid', $params['serviceid'])
+                ->value('value');
+            if (!empty($oldValue)) {
+                // Only copy if the new field is empty
+                $newValue = Capsule::table('tblcustomfieldsvalues')
+                    ->where('fieldid', $newSyncField->id)
+                    ->where('relid', $params['serviceid'])
+                    ->value('value');
+                if (empty($newValue)) {
+                    Capsule::table('tblcustomfieldsvalues')->updateOrInsert(
+                        ['fieldid' => $newSyncField->id, 'relid' => $params['serviceid']],
+                        ['value' => $oldValue]
+                    );
+                    $migrated[] = 'Last Usage Sync';
+                } else {
+                    $skipped[] = 'Last Usage Sync (already has value)';
+                }
+                // Clear old value regardless (legacy field cleanup)
+                Capsule::table('tblcustomfieldsvalues')
+                    ->where('fieldid', $oldSyncField->id)
+                    ->where('relid', $params['serviceid'])
+                    ->update(['value' => '']);
+            }
+        }
+
+        if (empty($migrated) && empty($skipped)) {
+            return 'No legacy data found to migrate.';
+        }
+
+        // Zero out legacy client-level fields now that values are migrated or skipped
+        $legacyFields = ['MultiPortal Tenant UUID', 'MultiPortal Username', 'MultiPortal Password', 'MultiPortal URL'];
+        foreach ($legacyFields as $legacyFieldName) {
+            $legacyField = Capsule::table('tblcustomfields')
+                ->where('type', 'client')
+                ->where('fieldname', $legacyFieldName)
+                ->first();
+            if ($legacyField) {
+                $legacyValue = Capsule::table('tblcustomfieldsvalues')
+                    ->where('fieldid', $legacyField->id)
+                    ->where('relid', $params['userid'])
+                    ->value('value');
+                if (!empty($legacyValue)) {
+                    Capsule::table('tblcustomfieldsvalues')
+                        ->where('fieldid', $legacyField->id)
+                        ->where('relid', $params['userid'])
+                        ->update(['value' => '']);
+                }
+            }
+        }
+        $migrated[] = 'Cleared legacy client-level fields';
+
+        $noteText = "Migrate: " . implode(', ', $migrated);
+        if (!empty($skipped)) {
+            $noteText .= ". Skipped: " . implode(', ', $skipped);
+        }
+
+        multiportal_log('MigrateCredentials', [
+            'service_id' => $params['serviceid'],
+            'migrated' => $migrated,
+            'skipped' => $skipped
+        ], $noteText);
+
+        multiportal_appendAdminNote($params['serviceid'], $noteText);
+
+        return 'success';
+    } catch (Exception $e) {
+        multiportal_appendAdminNote($params['serviceid'],
+            "Migrate Credentials ERROR: " . $e->getMessage());
         return 'Error: ' . $e->getMessage();
     }
 }

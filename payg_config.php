@@ -10,7 +10,9 @@ $payg_config = [
     'rates' => [
         'cpu_per_hour' => 0.10,          // Cost per CPU core per hour
         'memory_per_gb_hour' => 0.05,    // Cost per GB of RAM per hour
-        'storage_per_gb_hour' => 0.01,   // Cost per GB of storage per hour
+        'storage_per_gb_hour' => 0.01,           // Cost per GB of storage per hour
+        'backup_storage_per_gb_hour' => 0.01,   // Cost per GB of backup storage per hour
+        'iso_storage_per_gb_hour'    => 0.01,   // Cost per GB of ISO storage per hour
     ],
     
     // Billing settings
@@ -40,3 +42,5 @@ $payg_config = [
         ]
     ]
 ];
+
+return $payg_config;
